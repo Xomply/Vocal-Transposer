@@ -188,7 +188,22 @@ MSVC** — expect minor fixes around `#pragma pack` and `M_PI` (define `_USE_MAT
 ./build/vh_bench                    # CPU per block, cents error per interval, latency
 ./build/vh_demo ./audio             # synthetic singer -> dry + 6 wet variants
 ./build/vh_render take.wav out/ mytake "0:60,64,67; 2.5:59,62,67" 60
+./build/vh_sweep take.wav out.wav psola -12   # ONE engine, ONE constant interval, Mode B
 ```
+
+Plus two Python analysis tools (numpy only; matplotlib optional, for `--png`):
+
+```bash
+python3 tools/inspect_audio.py out.wav --from 11.2 --to 16.2        # spectrogram, F0, duty, waveform
+python3 tools/inspect_audio.py a.wav b.wav --png inspect/           # side-by-side images
+python3 tools/sweep_range.py ./build/vh_render ./build/vh_sweep take.wav ./sweep
+```
+
+**`inspect_audio.py` is the one to reach for when something sounds wrong and no number
+explains it.** Every other measurement in this repo is a scalar, and a scalar can only
+answer the question you thought to ask — VH-001 scored healthy on three of them at once,
+because a no-op preserves formants, preserves periodicity and leaves no gaps. Its
+`duty` view names the VH-008 pulse-train artefact, which no existing metric would have.
 
 `vh_render` is the one you will use most: **any real recording**, plus a chord progression
 as `time:note,note,note; time:...`, plus a root MIDI note for Mode B. It writes the same

@@ -8,6 +8,8 @@ and where to pick up.
 Then:
 - `ARCHITECTURE.md` — module-by-module reasoning, seams, confidence markers
 - `RESULTS.md` — measurements, listening guide, and the full bug log
+- `BUGS.md` — open defects with status (Backlog / Doing / In review / Done). Log
+  anything you find and cannot fix in scope; do not drop it and do not detour.
 
 ## Status
 

@@ -1,0 +1,29 @@
+Source recordings
+=================
+
+The two validation recordings are real human singing from the MTG essentia-audio
+test corpus (github.com/MTG/essentia-audio), which collects Creative Commons
+material from Freesound.
+
+They are NOT committed to this repository. Run ./tools/fetch_test_audio.sh to
+reproduce them exactly; the offsets and durations in that script are the ones
+RESULTS.md's real-voice figures were measured on.
+
+sustained_dry  — 5 s from the start of "long_voice" (recorded/long_voice.flac).
+                 A soprano sustaining roughly 810 Hz with natural vibrato and
+                 drift. The "continuous note" case: steady pitch, so grain
+                 behaviour is isolated from tracking behaviour.
+
+melody_dry     — 5 s from 30 s into a Carnatic varnam sung by Vignesh in Abhogi
+                 raaga, Freesound ID 223582 by user gopalkoduri.
+                 Roughly 210-320 Hz with clear melodic movement, plus tambura
+                 and accompaniment in the background. Deliberately the harder
+                 case: it is not a solo dry vocal, so the pitch tracker has
+                 competing periodic material. This is the recording on which the
+                 VH-002 clicking artefact reproduces.
+
+Both are converted to mono 48 kHz, trimmed to 5 s, and loudness-normalised
+before processing.
+
+Licences are those of the original Freesound uploads; consult the essentia-audio
+repository and the Freesound entries before redistributing the dry material.

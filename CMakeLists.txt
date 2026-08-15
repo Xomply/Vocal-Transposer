@@ -108,4 +108,12 @@ if(VH_BUILD_OFFLINE)
   add_executable(vh_bench tools/bench.cpp)
   target_link_libraries(vh_bench PRIVATE vh_core)
   target_include_directories(vh_bench PRIVATE tools)
+
+  # Renders ONE engine at ONE constant interval (Mode B), nothing else. Exists so that a
+  # control render can be produced at the SAME RATIO as the thing under test, which
+  # vh_render structurally cannot do — its variant table fixes RatioSource per variant.
+  # See the header comment in tools/sweep.cpp.
+  add_executable(vh_sweep tools/sweep.cpp)
+  target_link_libraries(vh_sweep PRIVATE vh_core)
+  target_include_directories(vh_sweep PRIVATE tools)
 endif()

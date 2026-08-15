@@ -1,0 +1,355 @@
+// tests/test_shifters.cpp — do the engines actually shift, and does PSOLA actually
+// preserve formants?
+//
+// The measurement approach matters here. Asserting "the code ran" proves nothing about a
+// pitch shifter. These tests synthesise a voice with KNOWN F0 and KNOWN formants, run it
+// through an engine, then MEASURE the output's F0 and spectral content. If PSOLA stops
+// preserving formants, or the granular shifter stops shifting, the numbers move.
+
+#include <doctest/doctest.h>
+
+#include "vh/audio_ring.hpp"
+#include "vh/granular_shifter.hpp"
+#include "vh/psola_shifter.hpp"
+#include "vh/rt.hpp"
+#include "vh/yin.hpp"
+
+#include <cmath>
+#include <complex>
+#include <vector>
+
+using namespace vh;
+
+namespace {
+
+constexpr double kSR = 48000.0;
+constexpr FrameCount kBlock = 128;
+
+// A synthetic voice: glottal pulse train through three formant resonators.
+//
+// WHY BUILD THIS RATHER THAN USE A SINE: the whole point of PSOLA is that it moves the
+// harmonics while leaving the formants alone. A sine has no formants, so the property
+// under test does not exist in the signal and the test would pass vacuously. A
+// source-filter synthetic gives ground truth for BOTH quantities — which a recorded voice
+// would not.
+std::vector<Sample> synthVoice(double f0, FrameCount n,
+                               double f1 = 700.0, double f2 = 1220.0, double f3 = 2600.0) {
+    std::vector<Sample> v(n, 0.0f);
+
+    const double period = kSR / f0;
+    std::vector<double> exc(n, 0.0);
+    for (double p = 0.0; p < static_cast<double>(n); p += period) {
+        const int start = static_cast<int>(p);
+        const int width = static_cast<int>(period * 0.3);
+        for (int k = 0; k < width && start + k < static_cast<int>(n); ++k) {
+            const double t = static_cast<double>(k) / width;
+            exc[static_cast<size_t>(start + k)] += 0.5 - 0.5 * std::cos(2.0 * M_PI * t);
+        }
+    }
+
+    auto resonate = [&](double fc, double bw, double amp) {
+        const double r = std::exp(-M_PI * bw / kSR);
+        const double theta = 2.0 * M_PI * fc / kSR;
+        const double a1 = -2.0 * r * std::cos(theta);
+        const double a2 = r * r;
+        double z1 = 0.0, z2 = 0.0;
+        for (FrameCount i = 0; i < n; ++i) {
+            const double y = exc[i] - a1 * z1 - a2 * z2;
+            z2 = z1; z1 = y;
+            v[i] += static_cast<Sample>(y * amp * (1.0 - r));
+        }
+    };
+    resonate(f1, 80.0, 1.0);
+    resonate(f2, 90.0, 0.5);
+    resonate(f3, 120.0, 0.25);
+
+    float peak = 1e-9f;
+    for (auto s : v) peak = std::max(peak, std::fabs(s));
+    for (auto& s : v) s *= 0.5f / peak;
+    return v;
+}
+
+// Measure F0 of a rendered buffer with our own analyser. Legitimate as a measuring
+// instrument because its accuracy is independently pinned in test_yin.cpp against tones
+// of known frequency.
+float measureF0(const std::vector<Sample>& sig) {
+    YinAnalyzer y;
+    y.prepare(kSR, kBlock);
+    AudioRing ring(1 << 17);
+    for (FrameCount i = 0; i + kBlock <= sig.size(); i += kBlock) {
+        ring.write(sig.data() + i, kBlock);
+        y.process(ring, ring.writePos());
+    }
+    return y.current().f0Hz;
+}
+
+// Energy in a frequency BAND, not at a single frequency.
+//
+// THE FIRST VERSION OF THIS HELPER MEASURED A SINGLE BIN AND WAS WRONG, in a way worth
+// recording because it is an easy trap: a formant is a resonance of the vocal tract, and
+// the signal only has energy where a HARMONIC happens to fall inside it. With a 300 Hz
+// fundamental there is simply no partial at 700 Hz, so a single-frequency probe measures
+// spectral leakage and returns whatever the window sidelobes happen to give — numbers that
+// look like data and are noise. Summing across a band that is wide relative to the
+// harmonic spacing always catches partials and measures the resonance itself.
+double bandEnergy(const std::vector<Sample>& sig, double flo, double fhi,
+                  FrameCount from, FrameCount len) {
+    double total = 0.0;
+    for (double f = flo; f <= fhi; f += 10.0) {
+        std::complex<double> acc{0.0, 0.0};
+        for (FrameCount i = 0; i < len && from + i < sig.size(); ++i) {
+            const double t = static_cast<double>(i);
+            // Hann, or the rectangular window's sidelobes swamp the measurement.
+            const double w = 0.5 - 0.5 * std::cos(2.0 * M_PI * t / static_cast<double>(len));
+            acc += std::polar(w * static_cast<double>(sig[from + i]), -2.0 * M_PI * f * t / kSR);
+        }
+        const double m = std::abs(acc) / static_cast<double>(len);
+        total += m * m;
+    }
+    return total;
+}
+
+// Run one shifter standalone at a fixed ratio.
+std::vector<Sample> render(IPitchShifter& sh, const std::vector<Sample>& in, double ratio) {
+    YinAnalyzer y;
+    y.prepare(kSR, kBlock);
+    AudioRing ring(1 << 17);
+    sh.prepare(kSR, kBlock);
+    sh.reset();
+
+    PreservationSpec pres;
+    ReadCursor cur;
+    std::vector<Sample> out(in.size(), 0.0f);
+    std::vector<Sample> blk(kBlock, 0.0f);
+    bool started = false;
+
+    for (FrameCount i = 0; i + kBlock <= in.size(); i += kBlock) {
+        ring.write(in.data() + i, kBlock);
+        y.process(ring, ring.writePos());
+
+        // Wait for the analyser to lock before starting, mirroring the Engine's lookback
+        // on note-on.
+        if (!started) {
+            if (y.current().f0Hz <= 0.0f) continue;
+            const FrameCount lat = sh.latencySamples();
+            cur.next = ring.writePos() > lat ? ring.writePos() - lat : 0;
+            started = true;
+        }
+
+        ShiftRequest req{};
+        req.ring = &ring;
+        req.analysis = &y.current();
+        req.cursor = &cur;
+        req.preservation = &pres;
+        req.ratio = ratio;
+        req.out = blk.data();
+        req.numFrames = kBlock;
+        sh.process(req);
+
+        for (FrameCount k = 0; k < kBlock; ++k) out[i + k] = blk[k];
+    }
+    return out;
+}
+
+float centsError(float measured, float expected) {
+    return static_cast<float>(1200.0 * std::log2(measured / expected));
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// Granular (fast path)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("granular shifter moves pitch by the requested ratio") {
+    const auto in = synthVoice(150.0, 60000);
+    for (double semis : {-5.0, -3.0, 3.0, 5.0, 7.0, 12.0}) {
+        const double ratio = std::pow(2.0, semis / 12.0);
+        GranularShifter g;
+        const auto out = render(g, in, ratio);
+        const float f = measureF0(out);
+        CAPTURE(semis);
+        REQUIRE(f > 20.0f);
+        CHECK(std::fabs(centsError(f, static_cast<float>(150.0 * ratio))) < 40.0f);
+    }
+}
+
+TEST_CASE("the two engines differ exactly as their algorithms predict: envelope moves vs stays") {
+    // THE TEST THAT DISTINGUISHES THE TWO ENGINES, and the reason the quality path exists.
+    //
+    // Same input, same ratio, one octave up. The granular path resamples, so the WHOLE
+    // spectrum stretches and energy migrates upward. PSOLA re-emits unmodified grains at a
+    // new rate, so the harmonics move but the envelope they sit under does not.
+    //
+    // Measured as spectral tilt — high-band energy over low-band — rather than as an
+    // absolute formant position. An earlier version of this test probed single frequencies
+    // and measured nothing but window leakage, because a formant only shows up where a
+    // harmonic happens to land inside it. A comparison between two engines on identical
+    // input is immune to that: whatever the measurement's quirks, both suffer them equally.
+    const auto in = synthVoice(150.0, 60000, 700.0, 1220.0, 2600.0);
+
+    GranularShifter g;
+    PsolaShifter p;
+    const auto og = render(g, in, 2.0);
+    const auto op = render(p, in, 2.0);
+
+    const FrameCount from = 30000, len = 8192;
+    auto tilt = [&](const std::vector<Sample>& s) {
+        return bandEnergy(s, 900.0, 1600.0, from, len) /
+               (bandEnergy(s, 250.0, 800.0, from, len) + 1e-18);
+    };
+
+    const double tiltIn  = tilt(in);
+    const double tiltG   = tilt(og);
+    const double tiltP   = tilt(op);
+    CAPTURE(tiltIn); CAPTURE(tiltG); CAPTURE(tiltP);
+
+    // Resampling drags the envelope up: markedly more high-band energy than the input had.
+    CHECK(tiltG > tiltIn * 5.0);
+    // PSOLA leaves the envelope where it was.
+    CHECK(tiltP < tiltIn * 3.0);
+    // And the two engines are unambiguously different, which is the point of running both.
+    CHECK(tiltG > tiltP * 5.0);
+}
+
+// ---------------------------------------------------------------------------
+// PSOLA (quality path)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("psola moves pitch by the requested ratio") {
+    const auto in = synthVoice(150.0, 60000);
+    for (double semis : {-5.0, -3.0, 2.0, 4.0, 7.0}) {
+        const double ratio = std::pow(2.0, semis / 12.0);
+        PsolaShifter p;
+        const auto out = render(p, in, ratio);
+        const float f = measureF0(out);
+        CAPTURE(semis);
+        REQUIRE(f > 20.0f);
+        CHECK(std::fabs(centsError(f, static_cast<float>(150.0 * ratio))) < 40.0f);
+    }
+}
+
+TEST_CASE("psola PRESERVES formants — the property the quality path exists for") {
+    // THE CENTRAL CLAIM OF THIS ENGINE. Shift up a fifth; F1 must stay near 700 Hz rather
+    // than sliding to ~1050 Hz the way the resampling path does.
+    //
+    // If this fails, the quality path has no reason to exist — it is just a slower
+    // granular shifter.
+    const auto in = synthVoice(150.0, 60000, 700.0, 1220.0, 2600.0);
+    PsolaShifter p;
+    const auto out = render(p, in, std::pow(2.0, 7.0 / 12.0));
+
+    const FrameCount from = out.size() / 2, len = 8192;
+    const double atF1     = bandEnergy(out, 600.0, 800.0, from, len);
+    const double atScaled = bandEnergy(out, 900.0, 1150.0, from, len);   // where resampling would put it
+    CHECK(atF1 > atScaled);
+}
+
+TEST_CASE("psola survives a downward shift past half-pitch without gapping") {
+    // The known trap: grains spaced further apart than the window is wide leave periodic
+    // holes, heard as a rough buzz rather than a low voice. Grain half-length is
+    // max(period, synthSpacing) precisely to prevent it.
+    const auto in = synthVoice(200.0, 60000);
+    PsolaShifter p;
+    const auto out = render(p, in, 0.45);
+
+    FrameCount longestGap = 0, run = 0;
+    for (FrameCount i = out.size() / 2; i < out.size() - kBlock; ++i) {
+        if (std::fabs(out[i]) < 1e-4f) { ++run; longestGap = std::max(longestGap, run); }
+        else run = 0;
+    }
+    CHECK(longestGap < 200);   // ~4 ms; a real gap would be a whole period or more
+}
+
+TEST_CASE("both shifters handle unvoiced audio without exploding") {
+    std::vector<Sample> nz(40000);
+    std::uint32_t s = 7u;
+    for (auto& x : nz) {
+        s = s * 1664525u + 1013904223u;
+        x = static_cast<Sample>((s >> 9) % 2000) / 1000.0f - 1.0f;
+        x *= 0.3f;
+    }
+
+    GranularShifter g;
+    PsolaShifter p;
+    const auto og = render(g, nz, 2.0);
+    const auto op = render(p, nz, 2.0);
+
+    for (auto x : og) REQUIRE(std::isfinite(x));
+    for (auto x : op) REQUIRE(std::isfinite(x));
+}
+
+TEST_CASE("neither shifter allocates on the audio thread") {
+    const auto in = synthVoice(140.0, 24000);
+    GranularShifter g;
+    PsolaShifter p;
+
+    rt::resetViolationCount();
+    render(g, in, 1.5);
+    render(p, in, 1.5);
+    CHECK(rt::violationCount() == 0);
+}
+
+TEST_CASE("reported latency is honest, and quality is the slower path") {
+    // The blender derives alignment from these numbers. A shifter that under-reports
+    // produces a comb between the two engines — easy to misdiagnose as a DSP bug in
+    // whichever engine you happened to inspect first.
+    GranularShifter g;
+    g.prepare(kSR, kBlock);
+    CHECK(g.latencySamples() > 0);
+
+    PsolaShifter p;
+    p.prepare(kSR, kBlock);
+    CHECK(p.latencySamples() > g.latencySamples());
+}
+
+TEST_CASE("signals that START WITH SILENCE stay finite — the real-recording case") {
+    // REGRESSION TEST for a bug that 36 synthetic tests missed, because every one of them
+    // began with a fully primed steady tone. Real recordings begin with silence, room
+    // tone, or a breath.
+    //
+    // With no F0 the granular shifter's geometry falls back to a long grain; early in the
+    // stream the read pointer's delay is briefly under the minimum, and the corrective
+    // jump subtracts more than has been written. pos_ went NEGATIVE, the unsigned cast was
+    // undefined behaviour, the interpolator's fractional part became enormous and the
+    // cubic overflowed to -inf. Infinity in an audio buffer is the loudest possible sound.
+    //
+    // Any new shifter should be run through this case before it is trusted.
+    for (double leadIn : {0.05, 0.25, 1.0}) {
+        std::vector<Sample> in(static_cast<size_t>(kSR * leadIn), 0.0f);
+        const auto voiced = synthVoice(150.0, 40000);
+        in.insert(in.end(), voiced.begin(), voiced.end());
+
+        for (double ratio : {0.5, 0.75, 1.5, 2.0}) {
+            GranularShifter g;
+            PsolaShifter p;
+            CAPTURE(leadIn); CAPTURE(ratio);
+            for (auto x : render(g, in, ratio)) REQUIRE(std::isfinite(x));
+            for (auto x : render(p, in, ratio)) REQUIRE(std::isfinite(x));
+        }
+    }
+}
+
+TEST_CASE("very high fundamentals stay finite — soprano range") {
+    // The real sustained sample is a soprano around 810 Hz, near YIN's 1000 Hz ceiling,
+    // where the period is only ~59 samples and every grain-size calculation is at its
+    // smallest. Worth pinning separately from the mid-range cases.
+    const auto in = synthVoice(800.0, 40000, 900.0, 2200.0, 3100.0);
+    for (double ratio : {0.5, 1.0, 1.25}) {
+        GranularShifter g;
+        PsolaShifter p;
+        CAPTURE(ratio);
+        for (auto x : render(g, in, ratio)) REQUIRE(std::isfinite(x));
+        for (auto x : render(p, in, ratio)) REQUIRE(std::isfinite(x));
+    }
+}
+
+TEST_CASE("output stays finite across extreme ratios") {
+    const auto in = synthVoice(110.0, 24000);
+    for (double r : {0.25, 0.5, 1.0, 2.0, 4.0}) {
+        GranularShifter g;
+        PsolaShifter p;
+        for (auto x : render(g, in, r)) REQUIRE(std::isfinite(x));
+        for (auto x : render(p, in, r)) REQUIRE(std::isfinite(x));
+    }
+}

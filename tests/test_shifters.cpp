@@ -245,20 +245,49 @@ TEST_CASE("psola PRESERVES formants — the property the quality path exists for
     CHECK(atF1 > atScaled);
 }
 
-TEST_CASE("psola survives a downward shift past half-pitch without gapping") {
-    // The known trap: grains spaced further apart than the window is wide leave periodic
-    // holes, heard as a rough buzz rather than a low voice. Grain half-length is
-    // max(period, synthSpacing) precisely to prevent it.
-    const auto in = synthVoice(200.0, 60000);
+TEST_CASE("psola actually LOWERS pitch past half-pitch, not merely avoids gapping") {
+    // THIS TEST PREVIOUSLY CHECKED ONLY FOR GAPS, and its comment named the
+    // max(period, synthSpacing) grain sizing as the thing protecting against them. That
+    // line was the VH-001 bug: it made each grain span 2/ratio SOURCE periods, so
+    // re-spacing the grains could not change the pitch and the output came back at the
+    // INPUT pitch. The absence of gaps was being used as a proxy for a working downward
+    // shift, and the two came apart completely — a test that passed on broken output.
+    //
+    // Absence of gaps is still worth pinning, so both assertions live here now. But the
+    // pitch assertion is the load-bearing one: it is the property the feature exists for.
+    const double f0 = 200.0;
+    const double ratio = 0.45;             // past half-pitch, where VH-001 lived
+    const auto in = synthVoice(f0, 60000);
     PsolaShifter p;
-    const auto out = render(p, in, 0.45);
+    const auto out = render(p, in, ratio);
 
     FrameCount longestGap = 0, run = 0;
     for (FrameCount i = out.size() / 2; i < out.size() - kBlock; ++i) {
         if (std::fabs(out[i]) < 1e-4f) { ++run; longestGap = std::max(longestGap, run); }
         else run = 0;
     }
-    CHECK(longestGap < 200);   // ~4 ms; a real gap would be a whole period or more
+    // Gaps are now EXPECTED and correct: at ratio 0.45 grains land every period/0.45
+    // samples and are only 2*period wide, so the space between glottal pulses is real
+    // output, not starvation. The bound is one synthesis spacing plus slack — enough to
+    // catch a shifter that has stopped emitting, loose enough not to punish the geometry.
+    const FrameCount spacing = static_cast<FrameCount>((48000.0 / f0) / ratio);
+    CHECK(longestGap < spacing + spacing / 2);
+
+    // THE ASSERTION THAT WAS MISSING. measureF0 is YIN, which picks the FIRST dip below
+    // threshold rather than the global minimum — that is precisely the choice that stops
+    // it reporting a subharmonic, and it is what makes it a valid instrument here. An
+    // estimator searching a narrow band around the EXPECTED output F0 would have scored
+    // the broken shifter as healthy, which is exactly how VH-001 survived both this suite
+    // and a measurement sweep. Do not "improve" this by narrowing the search.
+    //
+    // Output F0 is 90 Hz, comfortably above YIN's 70 Hz floor, so the instrument is in
+    // range. Lower the ratio much further in a new test and it will not be.
+    const double measured = measureF0(out);
+    const double want = f0 * ratio;
+    CHECK(measured == doctest::Approx(want).epsilon(0.08));
+
+    // And explicitly NOT the input pitch, which is the specific VH-001 failure signature.
+    CHECK(std::fabs(measured - f0) > 0.2 * f0);
 }
 
 TEST_CASE("both shifters handle unvoiced audio without exploding") {

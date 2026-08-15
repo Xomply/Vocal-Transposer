@@ -74,6 +74,15 @@ private:
     Pos clearedUpTo_ = 0;
 
     bool started_ = false;
+
+    // Absolute position of the most recently placed grain's centre, and whether one has
+    // ever been placed. Exists so the silence backstop can tell a LEGITIMATE gap between
+    // glottal pulses from genuine starvation — after the VH-001 fix, large downward shifts
+    // space grains further apart than a block, so blocks of true silence are correct
+    // output. See the backstop in psola_shifter.cpp.
+    Pos lastGrainPos_ = 0;
+    bool haveGrain_ = false;
+
     FrameCount latency_ = 0;
     FrameCount maxHalf_ = 0;
 

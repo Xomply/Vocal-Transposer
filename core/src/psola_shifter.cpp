@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace vh {
 
@@ -39,6 +40,8 @@ void PsolaShifter::reset() noexcept {
     nextSynthPos_ = 0.0;
     clearedUpTo_ = 0;
     started_ = false;
+    lastGrainPos_ = 0;
+    haveGrain_ = false;
 }
 
 void PsolaShifter::placeGrain(const AudioRing& ring, Pos centre, Pos sourceEpoch,
@@ -71,15 +74,30 @@ void PsolaShifter::process(const ShiftRequest& req) noexcept {
     const double ratio = req.ratio > 1e-6 ? req.ratio : 1e-6;
     const double synthSpacing = period / ratio;
 
-    // Grain half-length: at least one analysis period, so each grain carries a full cycle
-    // and therefore the full formant structure; and at least the synthesis spacing, so
-    // successive grains always overlap by 50% or more.
+    // Grain half-length: ONE analysis period, so each grain carries exactly one glottal
+    // pulse plus the taper either side of it. That is the whole mechanism — PSOLA lowers
+    // pitch by emitting one pulse LESS OFTEN, and raises it by emitting one pulse MORE
+    // often. The grain must therefore hold one pulse, never several.
     //
-    // WITHOUT the second condition a downward shift past about half-pitch spaces grains
-    // further apart than the window is wide, and the output develops periodic holes —
-    // heard as a rough buzz rather than a low voice.
+    // THIS LINE PREVIOUSLY READ min(max(period, synthSpacing), maxHalf_) — see BUGS.md
+    // VH-001. On a downward shift synthSpacing = period / ratio > period, so halfLen grew
+    // with the spacing and each grain spanned 2/ratio periods OF THE ORIGINAL WAVEFORM: at
+    // ratio 0.25, eight glottal pulses in one grain. A grain carrying eight pulses already
+    // contains the source's periodicity, so re-spacing such grains cannot change the pitch
+    // — overlapping them merely reconstructs the original. Measured output pitch was
+    // EXACTLY the input pitch at ratios 1/2, 1/3 and 1/4, and erratic between them.
+    //
+    // The reason the old line existed was real but misdiagnosed: at large downward ratios
+    // grains no longer overlap and the output develops periodic holes. THOSE HOLES ARE NOT
+    // A BUG. The gap between glottal pulses at a lower rate is what a lower-pitched voice
+    // IS. The old code suppressed the symptom and destroyed the function with it.
+    //
+    // The honest cost of the correct geometry is that large downward shifts get rougher as
+    // the inter-pulse gap widens, because a single copied pulse cannot fill it. That is a
+    // real limit of TD-PSOLA and one of the reasons a source-filter engine is on the
+    // roadmap; it is not something to fix by widening the grain.
     const FrameCount halfLen = static_cast<FrameCount>(
-        std::min(std::max(period, synthSpacing), static_cast<double>(maxHalf_)));
+        std::min(period, static_cast<double>(maxHalf_)));
 
     // Zero forward to `upTo`, so grains always land in clean accumulator.
     auto clearTo = [&](Pos upTo) noexcept {
@@ -132,12 +150,27 @@ void PsolaShifter::process(const ShiftRequest& req) noexcept {
         // spectral envelope rides along untouched inside the grain.
         const Pos srcEpoch = a.nearestEpoch(centre);
         if (srcEpoch > halfLen && ring.contains(srcEpoch - halfLen, halfLen * 2 + 1)) {
-            // Hann windows of half-length H at spacing S sum to H/S, so normalise by S/H.
+            // Overlap-add normalisation. Hann grains of half-length H laid down at spacing
+            // S sum to H/S *while they still overlap*, so the correction is S/H.
+            //
+            // THE CLAMP IS LOAD-BEARING AND IS PART OF THE VH-001 FIX. S/H is only valid
+            // for S <= 2H. Beyond that the grains no longer touch at all: each one stands
+            // alone and already peaks at unity, so scaling it by S/H (which reaches 4.0 at
+            // two octaves down and 8.0 at three) simply makes it that many times too loud.
+            // Before the clamp, -24 st and below hit full scale and clipped.
+            //
+            // Between S = H and S = 2H the true sum ripples below unity, so clamping there
+            // leaves the output slightly quiet rather than slightly loud. That is the right
+            // direction to err: quiet is a mix decision, clipped is destroyed samples.
+            //
             // Getting this wrong does not sound like a gain error — it sounds like the
             // shifter is louder at some intervals than others, which gets blamed on the
             // blend.
-            const float gain = static_cast<float>(synthSpacing / static_cast<double>(halfLen));
+            const float gain = static_cast<float>(
+                std::min(synthSpacing / static_cast<double>(halfLen), 1.0));
             placeGrain(ring, centre, srcEpoch, halfLen, gain);
+            lastGrainPos_ = centre;
+            haveGrain_ = true;
         }
         nextSynthPos_ += synthSpacing;
     }
@@ -153,21 +186,34 @@ void PsolaShifter::process(const ShiftRequest& req) noexcept {
     // legitimately place no grains at all and emit the tails of grains placed earlier.
     // Zero grains is healthy operation, not starvation.
     //
-    // The honest test is whether the emitted audio is actually empty. If it is — the
+    // The honest test WAS whether the emitted audio is actually empty. THAT IS NOW ALSO
+    // WRONG, and the VH-001 fix is what made it wrong — the same mistake one level down.
+    //
+    // With grains correctly sized at one analysis period, a large downward shift spaces
+    // them much further apart than the grain is wide: three octaves down on a 242 Hz voice
+    // places a 396-sample grain every 1584 samples, leaving 1188 samples — NINE consecutive
+    // 128-sample blocks — of genuine, correct silence between glottal pulses. That silence
+    // IS the lower pitch. Treating it as starvation and substituting unshifted passthrough
+    // filled every gap with the source, and the output came back at the SOURCE PITCH: the
+    // exact VH-001 symptom, produced by a completely different line.
+    //
+    // So the test is not "is this block empty" but "has it been too long since any grain
+    // landed at all". Two synthesis spacings is the threshold: one spacing is the normal
+    // gap, two means the grain that should have arrived did not. Genuine starvation — the
     // source has fallen off the ring, the epochs are stale, the cursor lags too little —
-    // then fall back to unshifted passthrough. A hole is far more audible and more
-    // alarming than a moment at the wrong pitch, and it is indistinguishable from a crash.
+    // still trips it, because in that state no grain lands for an unbounded time.
     //
     // A backstop, not a design. If it fires often something upstream is wrong (see the
     // history gate in Engine::process), and the ratio being briefly ignored is the symptom
     // that should send you looking.
-    float emitted = 0.0f;
-    for (FrameCount i = 0; i < n; ++i) {
-        const Sample v = ola_[(c + i) & olaMask_];
-        req.out[i] = v;
-        emitted += std::fabs(v);
+    for (FrameCount i = 0; i < n; ++i) req.out[i] = ola_[(c + i) & olaMask_];
+
+    const double sinceGrain = haveGrain_
+        ? static_cast<double>(c + n) - static_cast<double>(lastGrainPos_)
+        : std::numeric_limits<double>::infinity();
+    if (sinceGrain > 2.0 * synthSpacing + static_cast<double>(halfLen)) {
+        ring.read(c, req.out, n);
     }
-    if (emitted == 0.0f) ring.read(c, req.out, n);
 
     if (!cur.frozen) cur.next += n;
 }

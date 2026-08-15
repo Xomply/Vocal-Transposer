@@ -1,0 +1,22 @@
+# Build output
+build/
+*.o
+*.a
+
+# Rendered audio. Everything here is REGENERABLE from the tools and none of it
+# should be in history: vh_demo, vh_render and sweep_range.py rewrite it wholesale,
+# so committing it produces enormous binary diffs that convey nothing. Regenerate
+# with ./build/vh_demo ./audio and tools/sweep_range.py.
+audio/
+sweep/
+out/
+out2/
+inspect/
+*.wav
+
+# The two validation recordings are CC material and are fetched, not committed.
+# See ATTRIBUTION.txt and tools/fetch_test_audio.sh.
+sustained_dry.wav
+melody_dry.wav
+
+__pycache__/

@@ -19,7 +19,11 @@ void PsolaShifter::prepare(double sampleRate, FrameCount maxBlock) {
 
     // Must hold a whole block plus grains reaching a half-length either side, with room
     // to spare so the modulo wrap never collides with data still owed to the output.
-    FrameCount need = maxBlock + 6 * maxHalf_;
+    // 10x rather than 6x: mu < 1 stretches a grain to halfSrc/mu, which the clamp in
+    // process() caps at 2 * maxHalf_. The accumulator must hold a block plus grains
+    // reaching that far either side, with room so the modulo wrap never collides with
+    // data still owed to the output.
+    FrameCount need = maxBlock + 10 * maxHalf_;
     FrameCount cap = 1;
     while (cap < need) cap <<= 1;
     ola_.assign(cap, Sample{0});
@@ -44,10 +48,56 @@ void PsolaShifter::reset() noexcept {
     haveGrain_ = false;
 }
 
+// Read the ring at a FRACTIONAL offset from an anchor position.
+//
+// WHY THE OFFSET IS SEPARATE FROM THE ANCHOR: Pos is unsigned and the offset is signed.
+// Building one double from `anchor + offset` and casting it back is exactly the undefined
+// conversion that produced the `inf` bug in the granular shifter (RESULTS.md #5). Keeping
+// the anchor an integer and the offset a signed double means the only cast is on a small
+// number, and the wrap on `anchor + (Pos)i` is defined unsigned arithmetic.
+Sample PsolaShifter::readFrac(const AudioRing& ring, Pos anchor, double offset) noexcept {
+    const double fl = std::floor(offset);
+    const Pos base = anchor + static_cast<Pos>(static_cast<std::int64_t>(fl));
+    const float t = static_cast<float>(offset - fl);
+
+    const float xm1 = ring.at(base - 1), x0 = ring.at(base);
+    const float x1 = ring.at(base + 1), x2 = ring.at(base + 2);
+
+    const float c0 = x0;
+    const float c1 = 0.5f * (x1 - xm1);
+    const float c2 = xm1 - 2.5f * x0 + 2.0f * x1 - 0.5f * x2;
+    const float c3 = 0.5f * (x2 - xm1) + 1.5f * (x0 - x1);
+    return ((c3 * t + c2) * t + c1) * t + c0;
+}
+
+// Place one grain, resampling its CONTENT by mu on the way.
+//
+// THIS IS THE FORMANT KNOB, and it is the whole of it. See VOICE-MODEL.md §5.
+//
+// PSOLA sets PITCH by WHEN grains are emitted. Grain CONTENT was copied verbatim, but
+// nothing ever required that. Reading the source at `k * mu` for an output offset k means
+// the grain's own waveform is scaled in time by 1/mu, so every frequency inside it — the
+// formants — scales by mu, while the pitch stays exactly where the synthesis spacing put
+// it. Independent formant control, in the time domain, with no FFT and no filter model.
+//
+// AND IT PARTLY FILLS THE VH-008 GAP, not by luck. mu < 1 stretches the grain by 1/mu, so
+// duty = 2 * ratio / mu. A longer vocal tract genuinely has lower formants AND narrower
+// bandwidths AND therefore a longer ring; the thing we would otherwise be faking is the
+// thing a bigger body actually does.
+//
+// THE HONEST LIMIT: this scales the WHOLE grain, so it also stretches the glottal pulse
+// inside it, which is a change to the source character that VOICE-MODEL.md reading 3 says
+// to hold. Source and filter cannot be separated by resampling. That is what an LPC
+// residual/filter split would buy, and it is the sharpest argument for building one.
 void PsolaShifter::placeGrain(const AudioRing& ring, Pos centre, Pos sourceEpoch,
-                              FrameCount halfLen, float gain) noexcept {
-    const int len = static_cast<int>(halfLen);
+                              FrameCount halfOut, double mu, float gain) noexcept {
+    const int len = static_cast<int>(halfOut);
     if (len <= 1) return;
+
+    // mu == 1 is the identity and must stay BIT-IDENTICAL to the pre-profile engine, so
+    // that VoicingProfile::enabled = false is a real A/B control and not "almost the same
+    // plus interpolator noise".
+    const bool unity = std::abs(mu - 1.0) < 1e-12;
 
     for (int k = -len; k <= len; ++k) {
         // Normalised window position in [0,1].
@@ -55,9 +105,12 @@ void PsolaShifter::placeGrain(const AudioRing& ring, Pos centre, Pos sourceEpoch
         const int wi = static_cast<int>(wt * (kWindowTableSize - 1));
         const float w = window_[static_cast<size_t>(std::clamp(wi, 0, kWindowTableSize - 1))];
 
-        const Pos src = sourceEpoch + static_cast<Pos>(static_cast<std::int64_t>(k));
+        const Sample s = unity
+            ? ring.at(sourceEpoch + static_cast<Pos>(static_cast<std::int64_t>(k)))
+            : readFrac(ring, sourceEpoch, static_cast<double>(k) * mu);
+
         ola_[(centre + static_cast<Pos>(static_cast<std::int64_t>(k))) & olaMask_] +=
-            ring.at(src) * w * gain;
+            s * w * gain;
     }
 }
 
@@ -96,8 +149,22 @@ void PsolaShifter::process(const ShiftRequest& req) noexcept {
     // the inter-pulse gap widens, because a single copied pulse cannot fill it. That is a
     // real limit of TD-PSOLA and one of the reasons a source-filter engine is on the
     // roadmap; it is not something to fix by widening the grain.
-    const FrameCount halfLen = static_cast<FrameCount>(
+    const FrameCount halfSrc = static_cast<FrameCount>(
         std::min(period, static_cast<double>(maxHalf_)));
+
+    // THE FORMANT CURVE. mu = ratio^k, evaluated per block from the voicing profile — not
+    // a constant, because real voices do not vary linearly with F0 and a fixed number is
+    // the wrong shape for the answer. k = 0 gives mu = 1 and this engine behaves exactly
+    // as it did before the profile existed; k = 1 gives mu = ratio, which is the granular
+    // engine. See vh/voicing.hpp for the derivation and VOICE-MODEL.md §6 for why.
+    const double mu = req.preservation->voicing.muFor(ratio);
+
+    // Output half-length. The grain reads halfOut * mu == halfSrc samples of SOURCE either
+    // side of the epoch regardless of mu, so the ring lookahead in latencySamples() stays
+    // correct and only our own accumulator grows — which prepare() sized for.
+    const FrameCount halfOut = static_cast<FrameCount>(std::clamp(
+        static_cast<double>(halfSrc) / (mu > 1e-6 ? mu : 1e-6),
+        1.0, static_cast<double>(2 * maxHalf_)));
 
     // Zero forward to `upTo`, so grains always land in clean accumulator.
     auto clearTo = [&](Pos upTo) noexcept {
@@ -126,30 +193,34 @@ void PsolaShifter::process(const ShiftRequest& req) noexcept {
     if (!started_) {
         // Start the synthesis clock a half-grain BEHIND the emit point, so the very first
         // output samples already have grain tails overlapping them.
-        nextSynthPos_ = static_cast<double>(c > halfLen ? c - halfLen : 0);
+        nextSynthPos_ = static_cast<double>(c > halfOut ? c - halfOut : 0);
         clearedUpTo_ = static_cast<Pos>(nextSynthPos_);
         started_ = true;
     }
 
     // Never let the clock lag so far that grains would land in already-emitted output.
-    if (nextSynthPos_ + static_cast<double>(halfLen) < static_cast<double>(c)) {
-        nextSynthPos_ = static_cast<double>(c > halfLen ? c - halfLen : 0);
+    if (nextSynthPos_ + static_cast<double>(halfOut) < static_cast<double>(c)) {
+        nextSynthPos_ = static_cast<double>(c > halfOut ? c - halfOut : 0);
     }
 
     // Place every grain that can touch the block we are about to emit. Its centre may be
     // up to a half-length PAST the end of the block, because a grain's leading edge
     // reaches backwards.
-    const double horizon = static_cast<double>(c + n + halfLen);
+    const double horizon = static_cast<double>(c + n + halfOut);
     while (nextSynthPos_ < horizon) {
         const Pos centre = static_cast<Pos>(nextSynthPos_);
-        clearTo(centre + halfLen + 1);
+        clearTo(centre + halfOut + 1);
 
         // The heart of PSOLA: for this synthesis instant, find the analysis epoch nearest
         // in time and copy ITS waveform. Timing is preserved (the grain lands where the
         // synthesis clock says); pitch changes (the clock ticks at a different rate); the
         // spectral envelope rides along untouched inside the grain.
         const Pos srcEpoch = a.nearestEpoch(centre);
-        if (srcEpoch > halfLen && ring.contains(srcEpoch - halfLen, halfLen * 2 + 1)) {
+        // Residency is a SOURCE-side question: the grain reads +/- halfSrc of input
+        // regardless of mu, because halfOut * mu == halfSrc. Checking halfOut here
+        // would refuse perfectly available audio at mu < 1. The +/- 2 margin is the
+        // cubic interpolator's neighbourhood.
+        if (srcEpoch > halfSrc + 2 && ring.contains(srcEpoch - halfSrc - 2, halfSrc * 2 + 5)) {
             // Overlap-add normalisation — DERIVED, see BUGS.md VH-003. The answer is 1.0,
             // and the derivation is worth keeping because the wrong answer looked right.
             //
@@ -179,7 +250,7 @@ void PsolaShifter::process(const ShiftRequest& req) noexcept {
             // Peaks are measured in RESULTS.md; if a future change makes them clip, the
             // fix is headroom in the mixer, NOT a scale factor back in here.
             constexpr float gain = 1.0f;
-            placeGrain(ring, centre, srcEpoch, halfLen, gain);
+            placeGrain(ring, centre, srcEpoch, halfOut, mu, gain);
             lastGrainPos_ = centre;
             haveGrain_ = true;
         }
@@ -222,7 +293,7 @@ void PsolaShifter::process(const ShiftRequest& req) noexcept {
     const double sinceGrain = haveGrain_
         ? static_cast<double>(c + n) - static_cast<double>(lastGrainPos_)
         : std::numeric_limits<double>::infinity();
-    if (sinceGrain > 2.0 * synthSpacing + static_cast<double>(halfLen)) {
+    if (sinceGrain > 2.0 * synthSpacing + static_cast<double>(halfOut)) {
         ring.read(c, req.out, n);
     }
 

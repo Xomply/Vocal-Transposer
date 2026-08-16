@@ -110,14 +110,16 @@ double bandEnergy(const std::vector<Sample>& sig, double flo, double fhi,
 }
 
 // Run one shifter standalone at a fixed ratio.
-std::vector<Sample> render(IPitchShifter& sh, const std::vector<Sample>& in, double ratio) {
+std::vector<Sample> render(IPitchShifter& sh, const std::vector<Sample>& in, double ratio,
+                           const PreservationSpec* presOverride = nullptr) {
     YinAnalyzer y;
     y.prepare(kSR, kBlock);
     AudioRing ring(1 << 17);
     sh.prepare(kSR, kBlock);
     sh.reset();
 
-    PreservationSpec pres;
+    PreservationSpec presDefault;
+    const PreservationSpec& pres = presOverride ? *presOverride : presDefault;
     ReadCursor cur;
     std::vector<Sample> out(in.size(), 0.0f);
     std::vector<Sample> blk(kBlock, 0.0f);
@@ -174,24 +176,44 @@ TEST_CASE("granular shifter moves pitch by the requested ratio") {
     }
 }
 
-TEST_CASE("the two engines differ exactly as their algorithms predict: envelope moves vs stays") {
-    // THE TEST THAT DISTINGUISHES THE TWO ENGINES, and the reason the quality path exists.
+TEST_CASE("the engines differ exactly as their algorithms predict, and mu sits between them") {
+    // THE TEST THAT DISTINGUISHES THE ENGINES, and now also the test that pins the voicing
+    // profile's central claim.
     //
-    // Same input, same ratio, one octave up. The granular path resamples, so the WHOLE
-    // spectrum stretches and energy migrates upward. PSOLA re-emits unmodified grains at a
-    // new rate, so the harmonics move but the envelope they sit under does not.
+    // Same input, same ratio, one octave up. Three renders:
+    //
+    //   granular            resamples, so the WHOLE spectrum stretches. Envelope tracks
+    //                       the ratio: mu == ratio.
+    //   psola, profile OFF  re-emits UNMODIFIED grains, so the harmonics move and the
+    //                       envelope does not: mu == 1.
+    //   psola, profile ON   re-emits grains whose CONTENT is resampled by mu = ratio^0.3,
+    //                       so the envelope moves a little. Strictly between the two.
+    //
+    // THAT ORDERING IS THE WHOLE ARCHITECTURE OF VOICE-MODEL.md §6 IN ONE ASSERTION: the
+    // exponent interpolates continuously between the two engines already in the repo. If
+    // someone changes muFor() into something that is not monotone in k, this fails.
     //
     // Measured as spectral tilt — high-band energy over low-band — rather than as an
     // absolute formant position. An earlier version of this test probed single frequencies
     // and measured nothing but window leakage, because a formant only shows up where a
-    // harmonic happens to land inside it. A comparison between two engines on identical
-    // input is immune to that: whatever the measurement's quirks, both suffer them equally.
+    // harmonic happens to land inside it. A comparison BETWEEN renders on identical input
+    // is immune to that: whatever the measurement's quirks, all three suffer them equally.
+    //
+    // WHY ORDERING AND NOT ABSOLUTE THRESHOLDS: the previous version asserted
+    // `tiltP < tiltIn * 3.0`, which was a threshold tuned to mu == 1 and broke the moment
+    // mu became a curve — F1 at 700 Hz crosses the 800/900 Hz band edge under even a 23%
+    // warp, so the ratio leaps by two orders of magnitude for a small, correct change.
+    // The relationship being claimed was always an ordering. It is now written as one.
     const auto in = synthVoice(150.0, 60000, 700.0, 1220.0, 2600.0);
 
+    PreservationSpec hold;
+    hold.voicing.enabled = false;      // the A/B control: mu == 1, pre-profile behaviour
+
     GranularShifter g;
-    PsolaShifter p;
-    const auto og = render(g, in, 2.0);
-    const auto op = render(p, in, 2.0);
+    PsolaShifter pHold, pWarp;
+    const auto og      = render(g, in, 2.0);
+    const auto opHold  = render(pHold, in, 2.0, &hold);
+    const auto opWarp  = render(pWarp, in, 2.0);
 
     const FrameCount from = 30000, len = 8192;
     auto tilt = [&](const std::vector<Sample>& s) {
@@ -199,17 +221,48 @@ TEST_CASE("the two engines differ exactly as their algorithms predict: envelope 
                (bandEnergy(s, 250.0, 800.0, from, len) + 1e-18);
     };
 
-    const double tiltIn  = tilt(in);
-    const double tiltG   = tilt(og);
-    const double tiltP   = tilt(op);
-    CAPTURE(tiltIn); CAPTURE(tiltG); CAPTURE(tiltP);
+    const double tiltIn   = tilt(in);
+    const double tiltG    = tilt(og);
+    const double tiltHold = tilt(opHold);
+    const double tiltWarp = tilt(opWarp);
+    CAPTURE(tiltIn); CAPTURE(tiltG); CAPTURE(tiltHold); CAPTURE(tiltWarp);
 
     // Resampling drags the envelope up: markedly more high-band energy than the input had.
     CHECK(tiltG > tiltIn * 5.0);
-    // PSOLA leaves the envelope where it was.
-    CHECK(tiltP < tiltIn * 3.0);
-    // And the two engines are unambiguously different, which is the point of running both.
-    CHECK(tiltG > tiltP * 5.0);
+    // With the profile off, PSOLA leaves the envelope where it was. This is the claim the
+    // quality path was built on, and it must remain literally true, not approximately.
+    CHECK(tiltHold < tiltIn * 3.0);
+    // The profile moves it, but nothing like as far as resampling does.
+    CHECK(tiltWarp > tiltHold);
+    CHECK(tiltWarp < tiltG);
+    // And the extremes are still unambiguously different, which is why both engines exist.
+    CHECK(tiltG > tiltHold * 5.0);
+}
+
+TEST_CASE("voicing.enabled = false is BIT-IDENTICAL to the engine before the profile existed") {
+    // A meta-test, in the spirit of "the guard detects an allocation".
+    //
+    // The A/B control is only a control if it is exact. mu == 1 takes an integer read path
+    // in placeGrain specifically so that disabling the profile does not mean "the same
+    // plus cubic interpolator noise" — which would make every listening comparison between
+    // profile on and off a comparison of two changes rather than one.
+    //
+    // If someone removes the `unity` fast path as a simplification, this fails, and the
+    // comment defending it has a test attached.
+    const auto in = synthVoice(150.0, 40000, 700.0, 1220.0, 2600.0);
+
+    PreservationSpec off;
+    off.voicing.enabled = false;
+
+    PreservationSpec zeroK;            // the other way of spelling mu == 1
+    zeroK.voicing.muStrength = 0.0f;
+
+    PsolaShifter a, b;
+    const auto oa = render(a, in, 0.5, &off);
+    const auto ob = render(b, in, 0.5, &zeroK);
+
+    REQUIRE(oa.size() == ob.size());
+    for (size_t i = 0; i < oa.size(); ++i) REQUIRE(oa[i] == ob[i]);
 }
 
 // ---------------------------------------------------------------------------

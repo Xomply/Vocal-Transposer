@@ -20,10 +20,21 @@
 // pitch periods of lookahead, which at a low male fundamental is ~18 ms against the
 // granular shifter's ~13.
 //
-// KNOWN LIMIT: quality falls off past roughly +/- 6 semitones. Beyond that the grain
-// repetition (upward) or the gaps between grains (downward) become audible as roughness.
-// Octave-range shifting wants a source-filter method instead. Not a defect to be tuned
-// out; it is where the technique ends.
+// KNOWN LIMIT, restated after measurement — the inherited "+/- 6 semitones" was not what
+// this code does in either direction (BUGS.md VH-007). What actually bounds it:
+//
+//   UPWARD    tail cancellation between the many grains that overlap at high ratios.
+//             Level, not pitch. VH-003.
+//   DOWNWARD  two separate causes, often conflated. (1) The tract ring is truncated at
+//             T_source because a grain cannot be wider than one period without dragging
+//             in the next glottal pulse, so the deficit is worse at HIGH source pitch,
+//             not at low ratio. (2) The open quotient collapses: the excitation keeps its
+//             absolute duration while the period grows by 1/ratio, so the source becomes
+//             ever more impulse-like. VH-008 measured (2) and read it as (1).
+//
+// Only (1) needs a source-filter method. (2) is approximated here by the voicing profile's
+// tilt correction, and mu < 1 lengthens the grain and so partly mitigates (1) as well.
+// See VOICE-MODEL.md.
 
 #pragma once
 
@@ -45,8 +56,10 @@ public:
     const char* name() const noexcept override { return "psola"; }
 
 private:
+    static Sample readFrac(const AudioRing& ring, Pos anchor, double offset) noexcept;
+
     void placeGrain(const AudioRing& ring, Pos centre, Pos sourceEpoch,
-                    FrameCount halfLen, float gain) noexcept;
+                    FrameCount halfOut, double mu, float gain) noexcept;
 
     double sampleRate_ = 48000.0;
 

@@ -19,7 +19,14 @@
 // It is NOT a replacement for vh_render. vh_render renders the six-variant comparison a
 // human listens to; this renders one axis of an experiment.
 //
-// usage: vh_sweep <in.wav> <out.wav> <granular|psola> <semitones>
+// usage: vh_sweep <in.wav> <out.wav> <granular|psola> <semitones> [muStrength] [tiltStrength]
+//
+// The two optional arguments expose the voicing profile so the model can be swept from
+// the shell without a rebuild. Both default to 1.0 (the derived curve). Both 0.0 is the
+// pre-profile engine, bit-identical, and is the control every comparison needs.
+//
+//   muStrength    0 = hold formants (mu == 1)   1 = mu = ratio^0.3   3.33 = mu = ratio
+//   tiltStrength  0 = no open-quotient correction   1 = full
 
 #include "vh/engine.hpp"
 #include "vh/granular_shifter.hpp"
@@ -52,13 +59,17 @@ constexpr int kRoot = 60;
 int main(int argc, char** argv) {
     if (argc < 5) {
         std::fprintf(stderr,
-            "usage: vh_sweep <in.wav> <out.wav> <granular|psola> <semitones>\n"
-            "  Renders ONE engine at ONE constant interval, Mode B (IntervalFromRoot).\n");
+            "usage: vh_sweep <in.wav> <out.wav> <granular|psola> <semitones>"
+            " [muStrength] [tiltStrength]\n"
+            "  Renders ONE engine at ONE constant interval, Mode B (IntervalFromRoot).\n"
+            "  muStrength/tiltStrength default to 1.0; 0 0 is the pre-profile engine.\n");
         return 1;
     }
 
     const std::string inPath = argv[1], outPath = argv[2], which = argv[3];
     const int semis = std::atoi(argv[4]);
+    const float muStrength   = argc > 5 ? static_cast<float>(std::atof(argv[5])) : 1.0f;
+    const float tiltStrength = argc > 6 ? static_cast<float>(std::atof(argv[6])) : 1.0f;
 
     if (which != "granular" && which != "psola") {
         std::fprintf(stderr, "error: engine must be 'granular' or 'psola', got '%s'\n", which.c_str());
@@ -85,6 +96,8 @@ int main(int argc, char** argv) {
     cfg.maxBlock = kBlock;
     cfg.ratioSource = RatioSource::IntervalFromRoot;   // the whole point; see header comment
     cfg.rootMidiNote = kRoot;
+    cfg.preservation.voicing.muStrength = muStrength;
+    cfg.preservation.voicing.tiltStrength = tiltStrength;
 
     auto mkG = []() -> std::unique_ptr<IPitchShifter> { return std::make_unique<GranularShifter>(); };
     auto mkP = []() -> std::unique_ptr<IPitchShifter> { return std::make_unique<PsolaShifter>(); };

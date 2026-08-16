@@ -150,24 +150,35 @@ void PsolaShifter::process(const ShiftRequest& req) noexcept {
         // spectral envelope rides along untouched inside the grain.
         const Pos srcEpoch = a.nearestEpoch(centre);
         if (srcEpoch > halfLen && ring.contains(srcEpoch - halfLen, halfLen * 2 + 1)) {
-            // Overlap-add normalisation. Hann grains of half-length H laid down at spacing
-            // S sum to H/S *while they still overlap*, so the correction is S/H.
+            // Overlap-add normalisation — DERIVED, see BUGS.md VH-003. The answer is 1.0,
+            // and the derivation is worth keeping because the wrong answer looked right.
             //
-            // THE CLAMP IS LOAD-BEARING AND IS PART OF THE VH-001 FIX. S/H is only valid
-            // for S <= 2H. Beyond that the grains no longer touch at all: each one stands
-            // alone and already peaks at unity, so scaling it by S/H (which reaches 4.0 at
-            // two octaves down and 8.0 at three) simply makes it that many times too loud.
-            // Before the clamp, -24 st and below hit full scale and clipped.
+            // The old line was min(S/H, 1.0), from "Hann grains of half-length H at
+            // spacing S sum to H/S, so correct by S/H". That reasoning is about the
+            // WINDOW ENVELOPE and PSOLA is not an envelope problem.
             //
-            // Between S = H and S = 2H the true sum ripples below unity, so clamping there
-            // leaves the output slightly quiet rather than slightly loud. That is the right
-            // direction to err: quiet is a mix decision, clipped is destroyed samples.
+            // What actually has to be preserved is the amplitude of each glottal PULSE.
+            // A grain is centred on its epoch, so the pulse sits at the window's peak,
+            // w(0) = 1. Neighbouring grains contribute their TAILS at that instant, which
+            // are ring, not pulse, and small. So the pulse peak is already correct at
+            // unity and any S-dependent scaling makes it wrong.
             //
-            // Getting this wrong does not sound like a gain error — it sounds like the
-            // shifter is louder at some intervals than others, which gets blamed on the
-            // blend.
-            const float gain = static_cast<float>(
-                std::min(synthSpacing / static_cast<double>(halfLen), 1.0));
+            // Downward (S > H) the clamp already gave 1.0, which is why downward level
+            // was fine. Upward S = period/ratio < H = period, so the old expression
+            // returned 1/ratio and quietly attenuated every upward shift in proportion to
+            // the shift: -3.5 dB at +7 st, -10.5 dB at +21 st. Measured loss was larger
+            // still (-6.1 and -17.3), the remainder being genuine partial cancellation
+            // between the tails of the many grains that overlap at high ratios. That part
+            // is a property of the method, not of this line, and is not fixed here.
+            //
+            // PHYSICALLY this is also the right answer: raising pitch means firing the
+            // glottis more often at the same strength, so more energy per second is
+            // correct rather than something to normalise away.
+            //
+            // WATCH FOR: upward shifts are now louder than they were by up to ~17 dB.
+            // Peaks are measured in RESULTS.md; if a future change makes them clip, the
+            // fix is headroom in the mixer, NOT a scale factor back in here.
+            constexpr float gain = 1.0f;
             placeGrain(ring, centre, srcEpoch, halfLen, gain);
             lastGrainPos_ = centre;
             haveGrain_ = true;

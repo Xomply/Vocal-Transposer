@@ -12,6 +12,8 @@
 
 #pragma once
 
+#include "vh/voicing.hpp"
+
 namespace vh {
 
 enum class UnvoicedPolicy {
@@ -47,9 +49,12 @@ struct PreservationSpec {
     // buzzy and synthetic rather than as a bass singer. Literature puts a believable
     // octave-down at mu ~0.75-1.0.
     //
-    // PROVISIONAL: the 0.8 default is a starting point from the literature, not a
-    // measurement. Tune by ear in phase 4. IF IT IS WRONG: only the character of large
-    // downward shifts changes; nothing structural depends on it.
+    // SUPERSEDED, AND LEFT HERE ON PURPOSE. This is a single number standing in for a
+    // relationship: it suits an octave and is wrong at every other interval, which nobody
+    // discovered because nothing read it. `voicing` below replaces it with a curve, and
+    // the curve reproduces this value at an octave (0.5^0.3 = 0.81) from population data
+    // rather than from a citation. This field is now only used when `voicing.enabled` is
+    // false — the A/B control. See VOICE-MODEL.md §6.
     float envelopeWarp = 0.8f;
 
     // Apply envelopeWarp progressively with shift magnitude rather than as a constant.
@@ -57,7 +62,14 @@ struct PreservationSpec {
     // WHY: at a shift of a whole tone you want strict preservation; at an octave you want
     // the warp. A fixed warp makes small shifts sound subtly wrong in order to make large
     // ones sound right. CERTAIN in principle; the curve is provisional.
+    //
+    // SUPERSEDED by `voicing`, which IS this idea done properly: the curve is a derived
+    // power law rather than an unspecified "progressively".
     bool scaleWarpWithShift = true;
+
+    // How each voice property varies with the shift ratio. This is the model; the flags
+    // above are the legacy constants it replaces. See vh/voicing.hpp and VOICE-MODEL.md.
+    VoicingProfile voicing{};
 
     // Keep breath/noise energy unshifted while harmonics move.
     // CERTAIN: shifting aperiodicity with the harmonics tonalizes breath noise, which is

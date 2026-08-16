@@ -66,6 +66,34 @@ private:
 
     double sampleRate_ = 48000.0;
 
+    // THE HANDOVER between the grain path and passthrough, as a continuous mix rather
+    // than a branch. 1 = grains, 0 = unshifted source.
+    //
+    // WHY THIS IS NOT A BOOLEAN, which is what it was: at a voicing edge the two paths
+    // carry completely different waveforms — one is overlap-added grains at the target
+    // pitch, the other is the raw input — and switching between them writes a step into
+    // the output. A step is broadband; it clicks. MEASURED: every isolated click in the
+    // melody render, at every interval, landed within 12 ms of one of these switches
+    // (`steady` was 0 at +3, +7 and +12 st). The voicing edge is not where clicks are
+    // WORST, it is where they ALL are.
+    //
+    // A sung lyric crosses this boundary on every consonant, twice, which is why the
+    // symptom reads as "k, t, b, p all click" rather than as a pitch-shifting fault.
+    //
+    // The mix is stepped linearly and then shaped by a raised cosine, so the applied gain
+    // is C1 at both ends — the same requirement HANDOVER.md states for every other
+    // crossfade in this codebase, and for the same reason: a fade with a kink in its
+    // derivative clicks no matter how long you make it.
+    double mix_ = 0.0;
+    double mixStep_ = 0.0;        // per-sample, set in prepare() from kHandoverMs
+    bool parked_ = true;          // mix_ == 0 and staying there: grain path is idle
+
+    // Passthrough is rendered every block, not only when it is needed, because the
+    // starvation backstop cannot know it will fire until after grains have been placed.
+    // It is a ring read of one block; making it conditional would buy nothing and would
+    // add a state where the fallback has no material.
+    std::vector<Sample> through_;
+
     // Overlap-add accumulator, addressed by absolute position modulo its size.
     //
     // WHY AN ACCUMULATOR AND NOT A PER-BLOCK BUFFER: grains straddle block boundaries by

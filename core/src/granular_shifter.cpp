@@ -15,16 +15,50 @@ void GranularShifter::reset() noexcept {
     pos_ = 0.0;
     fadePos_ = 0.0;
     fadeRemaining_ = 0;
+    activeFadeLen_ = 1;
     started_ = false;
-    updateGeometry(0.0f, sampleRate_);
+    seeded_ = false;
+    geoPeriod_ = 0.0f;
+    updateGeometry(0.0f, sampleRate_, 0);
 }
 
-void GranularShifter::updateGeometry(float periodSamples, double sampleRate) noexcept {
+void GranularShifter::updateGeometry(float periodSamples, double sampleRate,
+                                     FrameCount elapsed) noexcept {
     // Geometry follows the singer. A shifter whose delay is a compile-time constant is
     // either too long for a soprano or too short for a bass; sized in periods it is
     // correct for both, and latencySamples() reports the truth to the blender.
     const float fallback = static_cast<float>(cfg_.unvoicedGrainMs * 0.001 * sampleRate);
-    const float p = periodSamples > 8.0f ? periodSamples : fallback;
+    const float raw = periodSamples > 8.0f ? periodSamples : fallback;
+
+    // SMOOTHED, and the reason is a layering argument rather than a tuning one.
+    //
+    // THE PITCH OF THIS ENGINE IS `rate`, NOT THIS NUMBER. The period here sizes the delay
+    // window, the jump distance and the crossfade — it decides the SHAPE of the delay line,
+    // not what comes out of it. So it needs to be approximately right, and it does not need
+    // to be right instantly.
+    //
+    // Feeding it the raw estimate meant every wrong hop resized the whole structure. On the
+    // melody at +12 st a single 361 Hz estimate on a 181 Hz voice halved every dimension for
+    // two hops, which doubles the jump rate and therefore doubles the number of crossfade
+    // seams, each of which is a small discontinuity. The clicks were not caused by the wrong
+    // pitch; they were caused by the geometry CHANGING.
+    //
+    // A one-pole at ~20 ms absorbs estimator noise while still following a real glide (a
+    // portamento takes 100 ms or more, so the lag is a few percent of the excursion). If a
+    // future analyser is stable enough that this does nothing, it costs one multiply.
+    //
+    // `elapsed` IS NOT OPTIONAL. This function runs once per BLOCK, not once per sample, so
+    // a coefficient derived from the sample rate alone gives a time constant multiplied by
+    // the block size — 20 ms became 2.5 seconds at a 128-sample block, the geometry never
+    // caught up with the singer, and the granular pitch test failed by 1971 cents. Written
+    // that way first; the test suite caught it in one run, which is the entire argument for
+    // `core` not needing a plugin host to be exercised.
+    const double k = elapsed > 0
+        ? 1.0 - std::exp(-static_cast<double>(elapsed) / (0.020 * sampleRate))
+        : 1.0;
+    if (geoPeriod_ <= 0.0f) geoPeriod_ = raw;
+    else geoPeriod_ += static_cast<float>(k) * (raw - geoPeriod_);
+    const float p = geoPeriod_;
 
     fadeLength_ = std::max(8, static_cast<int>(p * cfg_.fadeFraction));
     jumpSize_ = static_cast<FrameCount>(p * static_cast<float>(cfg_.jumpPeriods));
@@ -72,7 +106,16 @@ void GranularShifter::process(const ShiftRequest& req) noexcept {
     ReadCursor& cur = *req.cursor;
     const Pos writePos = ring.writePos();
 
-    updateGeometry(a.periodSamples, sampleRate_);
+    updateGeometry(a.periodSamples, sampleRate_, req.numFrames);
+
+    // Per-voice RNG seed, taken from the cursor because that is the one piece of per-voice
+    // identity a shifter can see. Every GranularShifter used to start from the same
+    // constant, so all N voices randomised their unvoiced jumps IDENTICALLY — which is not
+    // randomisation at all across an ensemble, only within one voice's own history.
+    if (!seeded_) {
+        rng_ = cur.rngState | 1u;
+        seeded_ = true;
+    }
 
     if (!started_) {
         pos_ = static_cast<double>(writePos > baseDelay_ ? writePos - baseDelay_ : 0);
@@ -135,6 +178,10 @@ void GranularShifter::process(const ShiftRequest& req) noexcept {
                     fadePos_ = pos_;
                     pos_ = want;
                     fadeRemaining_ = fadeLength_;
+                    // SNAPSHOT. The fade's gain is 1 - fadeRemaining_/LENGTH, so LENGTH
+                    // must be the length THIS fade started with. See the comment on
+                    // activeFadeLen_ in the header for what happens when it is not.
+                    activeFadeLen_ = fadeLength_;
                 }
             }
         }
@@ -142,7 +189,8 @@ void GranularShifter::process(const ShiftRequest& req) noexcept {
         Sample s = interpolate(ring, pos_);
 
         if (fadeRemaining_ > 0) {
-            const float x = 1.0f - static_cast<float>(fadeRemaining_) / static_cast<float>(fadeLength_);
+            const float x = 1.0f - static_cast<float>(fadeRemaining_) /
+                                   static_cast<float>(activeFadeLen_);
             // Raised cosine: zero slope at both ends. The Shepard-tone lesson is that a
             // partial can be born and die inaudibly if the envelope is C1 at the
             // boundaries; a fade with a kink in its derivative clicks no matter how long

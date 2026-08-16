@@ -11,6 +11,18 @@ namespace {
 // Longest period we ever handle: the 70 Hz lower bound of the tracker.
 constexpr double kLowestF0 = 70.0;
 constexpr int kWindowTableSize = 2048;
+
+// PROVISIONAL: 8 ms to hand over between the grain path and passthrough.
+//
+// Chosen to match the Engine's note envelope, which has been long enough to remove a click
+// since the first milestone, and short enough that a plosive still reads as a plosive. The
+// trade is explicit: longer is smoother and smears the consonant, shorter is tighter and
+// eventually clicks again. The two paths carry the SAME event at slightly different
+// pitches, so the smear is a doubling rather than a blur — which is why this can be as
+// short as it is.
+//
+// TUNE BY EAR on /t/ and /k/ before anything else in this file.
+constexpr double kHandoverMs = 8.0;
 } // namespace
 
 void PsolaShifter::prepare(double sampleRate, FrameCount maxBlock) {
@@ -35,6 +47,9 @@ void PsolaShifter::prepare(double sampleRate, FrameCount maxBlock) {
         window_[static_cast<size_t>(i)] = static_cast<float>(0.5 - 0.5 * std::cos(2.0 * M_PI * t));
     }
 
+    through_.assign(maxBlock, Sample{0});
+    mixStep_ = 1.0 / (kHandoverMs * 0.001 * sampleRate);
+
     latency_ = 2 * maxHalf_;
     reset();
 }
@@ -52,6 +67,13 @@ void PsolaShifter::reset() noexcept {
     tiltKT_ = 0.0;
     tiltKS_ = 0.0;
     tiltPrimed_ = false;
+
+    // Start PARKED on passthrough rather than on grains. A voice that has just been reset
+    // has an empty accumulator, so starting at mix 1 would fade IN from silence over the
+    // handover — which is a hole exactly at note-on. Starting parked means the first
+    // audible thing is the source, and grains fade in over it as they become available.
+    mix_ = 0.0;
+    parked_ = true;
 }
 
 // Read the ring at a FRACTIONAL offset from an anchor position.
@@ -277,20 +299,45 @@ void PsolaShifter::process(const ShiftRequest& req) noexcept {
         while (clearedUpTo_ < upTo) { ola_[clearedUpTo_ & olaMask_] = 0.0f; ++clearedUpTo_; }
     };
 
+    // Unvoiced, or nothing to be pitch-synchronous with. NOT a branch any more — see the
+    // comment on mix_ in the header. This decides the TARGET of a crossfade.
     const bool passThrough =
         (a.voicing == Voicing::Unvoiced && req.preservation->unvoiced != UnvoicedPolicy::Shift) ||
         a.periodSamples < 8.0f || a.epochCount == 0;
 
-    if (passThrough) {
-        // Unvoiced, or nothing to be pitch-synchronous with. Pass the audio through and
-        // restart the synthesis clock so voicing resumes in phase with the output rather
-        // than wherever it drifted to during the gap.
-        ring.read(c, req.out, n);
+    // The unshifted path. Rendered LAZILY — see the fast path further down, which is the
+    // common case and needs no passthrough at all. `ring.read` returns false if the span
+    // has fallen off the history and leaves the buffer as it was, so zero it first: a
+    // failed read must be silence, not the previous block repeated.
+    auto fillThrough = [&]() noexcept {
+        for (FrameCount i = 0; i < n; ++i) through_[i] = 0.0f;
+        ring.read(c, through_.data(), n);
+    };
+
+    // PARKED: the mix has reached passthrough and is staying there. Skip grain placement
+    // entirely — it is the expensive part of this function and it would be multiplied by
+    // zero — and keep the synthesis clock pinned to the output so that when voicing
+    // resumes, grains resume in phase with what is being emitted rather than from wherever
+    // the clock drifted to during the gap.
+    if (parked_ && passThrough) {
         clearTo(c + n);
         nextSynthPos_ = static_cast<double>(c + n);
         started_ = true;
+        tiltPrimed_ = false;
+        fillThrough();
+        for (FrameCount i = 0; i < n; ++i) req.out[i] = through_[i];
         if (!cur.frozen) cur.next += n;
         return;
+    }
+
+    if (parked_) {
+        // Leaving the parked state. Re-run the start alignment so the first grains have
+        // somewhere to land: a grain centred exactly at `c` writes its whole leading half
+        // into audio that has already been emitted, so it arrives at half strength.
+        nextSynthPos_ = static_cast<double>(c > halfOut ? c - halfOut : 0);
+        clearedUpTo_ = static_cast<Pos>(nextSynthPos_);
+        parked_ = false;
+        started_ = true;
     }
 
     if (!started_) {
@@ -396,17 +443,59 @@ void PsolaShifter::process(const ShiftRequest& req) noexcept {
     const double sinceGrain = haveGrain_
         ? static_cast<double>(c + n) - static_cast<double>(lastGrainPos_)
         : std::numeric_limits<double>::infinity();
-    if (sinceGrain > 2.0 * synthSpacing + static_cast<double>(halfOut)) {
-        ring.read(c, req.out, n);
-        // Do NOT tilt the backstop's output. It is unshifted source, so its open quotient
-        // is already the source's own and correct for the source's pitch; tilting it would
-        // colour the one path in this engine that is meant to be transparent.
-        tiltPrimed_ = false;
+    const bool starved = sinceGrain > 2.0 * synthSpacing + static_cast<double>(halfOut);
+
+    const double target = (passThrough || starved) ? 0.0 : 1.0;
+
+    // FAST PATH: no handover in progress. This is the overwhelmingly common case — a
+    // handover lasts 8 ms and a sustained note lasts seconds — and taking it matters,
+    // because the loop below costs a transcendental per sample per voice. Written without
+    // this check first, and `vh_bench` went from 12% to 37% of budget at 16 voices: 2048
+    // cosines per block that almost always multiply by one.
+    //
+    // The output is already the grain path, so at mix 1 there is nothing to do at all.
+    if (mix_ >= 1.0 && target >= 1.0) {
+        applySourceTilt(req, a, ratio, n);
         if (!cur.frozen) cur.next += n;
         return;
     }
 
+    // Tilt is applied to the GRAIN path only, before the handover mixes passthrough in.
+    // Passthrough is unshifted source, so its open quotient is already correct for its own
+    // pitch; tilting it would colour the one signal in this engine meant to be transparent.
     applySourceTilt(req, a, ratio, n);
+
+    // THE HANDOVER. Both paths exist for every sample of the transition, so there is never
+    // an instant where the output jumps from one to the other.
+    //
+    // Starvation feeds the SAME dial rather than overriding the output. The old backstop
+    // substituted passthrough immediately, which is a hard switch and therefore the exact
+    // defect this crossfade exists to remove — and it fires in the middle of a note, where
+    // a click is least maskable. Fading instead costs 8 ms of the backstop arriving late,
+    // during which the grain path is by definition already silent (that is what starvation
+    // means), so the fade is from near-silence and the cost is not audible.
+    fillThrough();
+
+    for (FrameCount i = 0; i < n; ++i) {
+        if (mix_ < target)      mix_ = std::min(target, mix_ + mixStep_);
+        else if (mix_ > target) mix_ = std::max(target, mix_ - mixStep_);
+
+        // Raised cosine on the linear ramp: zero slope at both ends.
+        const float g = static_cast<float>(0.5 - 0.5 * std::cos(M_PI * mix_));
+
+        // EQUAL-GAIN, matching the engine blend's normalisation rather than an equal-power
+        // law. The two paths carry the same event, so on a voiced->voiced handover (the
+        // starvation case) they are correlated and equal-power would put a +3 dB bump in
+        // the middle of every fade. At a genuine voicing edge they are uncorrelated and
+        // equal-gain gives a small dip instead; a dip at a consonant boundary is the better
+        // failure, and it is masked by the consonant.
+        req.out[i] = req.out[i] * g + through_[i] * (1.0f - g);
+    }
+
+    if (mix_ <= 0.0 && target == 0.0) {
+        parked_ = true;
+        tiltPrimed_ = false;
+    }
 
     if (!cur.frozen) cur.next += n;
 }

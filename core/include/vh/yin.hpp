@@ -53,6 +53,52 @@ struct YinConfig {
     // PROVISIONAL: 200 ms. Long enough to bridge any consonant; short enough that a
     // genuinely abandoned phrase does not leave a stale pitch lying around.
     float maxHoldMs = 200.0f;
+
+    // --- the voicing GATE ---------------------------------------------------------
+    //
+    // WHY A GATE AND NOT A COMPARISON. The voicing decision used to be nothing but "did
+    // this hop find a dip below threshold", evaluated every 128 samples. Near the
+    // threshold — which is where consonants, note entries and quiet passages all live —
+    // that flips back and forth every 2.7 ms. MEASURED on the melody recording: 27
+    // passthrough flips in 5 seconds, six of them lasting under 8 ms. Every one of those
+    // flips is a mode change in both shifters, and downstream of a hard switch it was a
+    // click; downstream of a crossfade it is still a needless 8 ms of the shifted path
+    // fading out and back in.
+    //
+    // ASYMMETRIC ON PURPOSE. Becoming voiced is immediate, because a late note entry is
+    // the one thing an instrument may not do. Becoming unvoiced waits, because nothing
+    // bad happens if the first few milliseconds of a fricative are still being shifted —
+    // a fricative is broadband noise and the shift is inaudible over that span — whereas
+    // dropping out on a momentary dip is very audible.
+    //
+    // The cost, stated plainly: a genuine consonant starts passing through
+    // `releaseHops * hopSamples` late. At the defaults that is 10.7 ms. TUNE by counting
+    // flips in a vh_trace CSV, not by ear — the ear cannot separate this from the
+    // handover crossfade downstream of it.
+    int releaseHops = 4;
+
+    // --- F0 MOMENTUM --------------------------------------------------------------
+    //
+    // Believe small changes immediately; require a large one to be corroborated before
+    // committing to it.
+    //
+    // WHY: a single-hop estimate is allowed to be wrong, and when it is wrong it is
+    // usually wrong by an octave or by a formant — never by 30 cents. Committing to that
+    // estimate moves the synthesis spacing, the grain size, the epoch tracker's cutoff
+    // and (in Mode A) the ratio itself, all within one hop, and then moves them all back.
+    // That is a discontinuity per wrong estimate.
+    //
+    // maxStepCents is deliberately generous: 120 cents per hop is 4400 cents/second,
+    // which is faster than any real portamento and far faster than vibrato (~5 cents per
+    // hop at 6 Hz and 100 cents depth). So ordinary singing never touches this path, and
+    // what does touch it is estimator noise.
+    //
+    // Anything larger costs `jumpConfirmHops` hops before it is believed — 5.3 ms at the
+    // defaults. This is the design-notes principle applied to the tracker: uncertainty
+    // costs LATENCY, not correctness. A genuine octave leap still lands, 5 ms late; a
+    // spurious one never lands at all.
+    float maxStepCents = 120.0f;
+    int jumpConfirmHops = 2;
 };
 
 class YinAnalyzer final : public IAnalyzer {
@@ -93,6 +139,16 @@ private:
     Pos nextAnalysisPos_ = 0;
     FrameCount holdSamples_ = 0;
     FrameCount maxHoldSamples_ = 0;
+
+    // F0 momentum. `trackedPeriod_` is what we have COMMITTED to; `pendingPeriod_` is a
+    // candidate large jump that has not yet been corroborated. See YinConfig.
+    float trackedPeriod_ = 0.0f;
+    float pendingPeriod_ = 0.0f;
+    int pendingCount_ = 0;
+
+    // Voicing gate. Counts consecutive hops with no confident estimate; voicing is only
+    // reported Unvoiced once it reaches cfg_.releaseHops.
+    int unvoicedRun_ = 0;
 
     // Epoch tracking runs sample-by-sample and therefore on its own clock, independent of
     // the F0 hop. Keeping them separate matters: F0 can afford to update every 2.7 ms,

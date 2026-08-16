@@ -63,6 +63,30 @@ struct Humanization {
     float vibratoPhase = 0.0f;       // randomised per voice — this is the point
     float envelopeWarpOffset = 0.0f; // slight per-voice vocal-tract difference
     float pan = 0.0f;                // -1..+1
+
+    // A fixed per-voice delay on the whole voice, in milliseconds. The first row of this
+    // struct the Engine actually reads.
+    //
+    // WHY A STATIC DELAY IS THE FIX FOR THE SIBILANT COLLAPSE (BUGS.md VH-005). Passing a
+    // fricative through unshifted is correct PER VOICE, but N voices then emit N sample-
+    // identical copies. Identical copies sum COHERENTLY: four voices at 1/sqrt(4) gain
+    // give twice the amplitude, which is the measured 1.7x energy in the demo's fricative
+    // region, and the ensemble audibly collapses to unison and re-widens at every /s/.
+    //
+    // Broadband noise decorrelates within about 0.1 ms, so a per-voice offset of a few
+    // milliseconds makes those copies sum in POWER instead — sqrt(N) rather than N. The
+    // voiced parts are unaffected in any way that matters, because each voice is already
+    // at a different pitch, and a pure delay changes no timbre at all: it is four singers
+    // standing at four distances from one microphone, which is the physical situation
+    // being modelled.
+    //
+    // WHY NOT AN ALLPASS, which is the other candidate the ledger names: an allpass is
+    // flat in magnitude but disperses the glottal pulse on VOICED frames too, so it would
+    // have to be switched in and out with voicing — and a switched filter is exactly the
+    // class of defect the handover crossfade exists to remove. A static delay needs no
+    // switching, so it cannot introduce one. If comb coloration between the delayed copies
+    // turns out to be audible, an allpass is the next thing to try; it is not needed yet.
+    float staticDelayMs = 0.0f;
 };
 
 enum class VoiceState {
@@ -101,6 +125,15 @@ struct Voice {
     // whatever amplitude the waveform happened to be at.
     float envGain = 0.0f;
     float envTarget = 1.0f;
+
+    // The envelope's RAMP POSITION, 0..1, from which envGain is derived through a raised
+    // cosine. envGain itself is not ramped linearly any more.
+    //
+    // WHY: a linear ramp is C0, not C1 — its derivative steps at both ends. HANDOVER.md
+    // states the rule ("every crossfade is at least C1: a fade with a kink in its
+    // derivative clicks no matter how long you make it") and this envelope was the one
+    // place in the codebase that broke it, on every note-on and every note-off.
+    float envPhase = 0.0f;
 
     // Whether each engine ran last block. The Engine skips engines whose blend weight is
     // inaudible, as a free CPU governor — but a stateful shifter coming back after being

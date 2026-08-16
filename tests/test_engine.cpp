@@ -351,8 +351,21 @@ TEST_CASE("a note pressed on an EMPTY ring still produces sound — the history 
 TEST_CASE("reported latency reflects the mode") {
     // Mode B should not be paying the analyser's acquisition cost. This is the latency
     // argument for Mode B, asserted rather than believed.
+    //
+    // THIS TEST USED TO READ `b->latencySamples() == 0`, and that was a PROXY, not the
+    // claim. It happened to hold only because Mode B with no shifters had no other source
+    // of latency at all. When the per-voice decorrelation delay landed (BUGS.md VH-005) it
+    // added a term to BOTH modes and the proxy failed while the claim was still true.
+    //
+    // So assert the claim directly: the DIFFERENCE between the modes is the analyser, and
+    // it is the whole analyser. Anything common to both modes cancels, which is what makes
+    // this form survive changes elsewhere. HANDOVER.md §6, "measure the thing, not a proxy
+    // for it", recurring for the third time in this repository.
     auto a = makeEngine(RatioSource::AbsoluteTarget);
     auto b = makeEngine(RatioSource::IntervalFromRoot);
     CHECK(a->latencySamples() > b->latencySamples());
-    CHECK(b->latencySamples() == 0);
+
+    YinAnalyzer probe;
+    probe.prepare(kSR, kBlock);
+    CHECK(a->latencySamples() - b->latencySamples() == probe.latencySamples());
 }

@@ -61,7 +61,9 @@ private:
     // multiplies and removes it.
     static Sample interpolate(const AudioRing& ring, double pos) noexcept;
 
-    void updateGeometry(float periodSamples, double sampleRate) noexcept;
+    // `elapsed` is the block length: this runs per block, so the smoothing coefficient
+    // must be derived from block time, not sample time. See the .cpp.
+    void updateGeometry(float periodSamples, double sampleRate, FrameCount elapsed) noexcept;
 
     GranularConfig cfg_{};
     double sampleRate_ = 48000.0;
@@ -71,12 +73,49 @@ private:
     int fadeRemaining_ = 0;
     int fadeLength_ = 0;
 
+    // The length the CURRENTLY RUNNING fade began with, which is not always fadeLength_.
+    //
+    // THE BUG THIS FIXES, found by instrumenting the shifter directly and worth recording
+    // because the symptom is indistinguishable from a pitch-tracking fault:
+    //
+    // updateGeometry() recomputes fadeLength_ from the current period on every block,
+    // including blocks in the middle of a fade. The gain is 1 - fadeRemaining_/fadeLength_,
+    // so changing the denominator part-way through moves the ramp under the fade. If the
+    // period rises the gain steps; if it falls, fadeLength_ drops below fadeRemaining_, the
+    // argument goes NEGATIVE, and because the raised cosine is an even function the gain
+    // turns around and heads back the way it came — the two taps re-cross and the envelope
+    // stops being monotonic.
+    //
+    // MEASURED: at +12 st on the melody, an F0 estimate of 361 Hz on a 181 Hz voice halved
+    // the period for a few hops; the block on which the geometry corrected itself carries
+    // the largest discontinuity in the whole file (|dx| = 0.084 against a block peak of
+    // 0.061 — a step bigger than the signal).
+    //
+    // This can only happen while the pitch is MOVING, which is exactly the condition
+    // BUGS.md VH-002 records and exactly why the granular path showed clicks too despite
+    // sharing no code with PSOLA. It is neither of VH-002's two candidates.
+    //
+    // A FIX THAT WAS TRIED AND WAS WORSE, recorded so it is not tried again: deferring
+    // updateGeometry() until no fade is in flight. At ratio 2 the fade occupies half the
+    // time between jumps, so block boundaries keep landing inside one and the update
+    // starves for many blocks — then arrives all at once, which is a bigger step than the
+    // one being avoided. The geometry must keep updating; it is the FADE that must be
+    // insulated from it.
+    int activeFadeLen_ = 1;
+
     FrameCount baseDelay_ = 0;
     FrameCount minDelay_ = 0;
     FrameCount maxDelay_ = 0;
     FrameCount jumpSize_ = 0;
 
+    // Smoothed period driving the geometry. NOT the pitch — see updateGeometry().
+    float geoPeriod_ = 0.0f;
+
     bool started_ = false;
+
+    // Seeded from the cursor on the first block after a reset, so that N voices do not
+    // share one random sequence. See granular_shifter.cpp.
+    bool seeded_ = false;
     std::uint32_t rng_ = 22222u;
 };
 

@@ -22,12 +22,15 @@ enum class UnvoicedPolicy {
     // sing a fifth higher. Shifting it is simply the wrong operation.
     PassThrough,
 
-    // ...BUT see the open issue. With N voices all passing the SAME /s/ through
-    // unmodified, the ensemble collapses to N identical mono copies at every sibilant and
-    // re-widens when voicing resumes — an audible pumping of stereo width. Real backing
-    // singers sibilate decorrelated.
-    // This option exists to hold the place for the fix (per-voice allpass / micro-delay /
-    // mild spectral warp). NOT YET IMPLEMENTED — deliberately deferred, see ARCHITECTURE.
+    // ...BUT with N voices all passing the SAME /s/ through unmodified, the ensemble
+    // collapses to N identical mono copies at every sibilant and re-widens when voicing
+    // resumes — an audible pumping of width. Real backing singers sibilate decorrelated.
+    //
+    // NOW IMPLEMENTED, and this is the DEFAULT. The realisation is a per-voice static
+    // delay of 0.5-4 ms applied to the whole voice in Engine::process, not a treatment of
+    // the unvoiced path specifically — see Humanization::staticDelayMs for why that is the
+    // right shape and why an allpass was rejected. `PassThrough` above is retained as the
+    // A/B control, and selecting it reproduces the pre-fix behaviour exactly.
     PassThroughDecorrelated,
 
     // Escape hatch for A/B listening. Almost certainly sounds wrong; keep it so the
@@ -82,7 +85,7 @@ struct PreservationSpec {
     // octave-up halves the perceived depth and an octave-down doubles it. CERTAIN.
     bool vibratoConstantInCents = true;
 
-    UnvoicedPolicy unvoiced = UnvoicedPolicy::PassThrough;
+    UnvoicedPolicy unvoiced = UnvoicedPolicy::PassThroughDecorrelated;
 
     // Nothing time-stretches. Ever. Present as a named field rather than an unwritten
     // assumption so that a future reader knows it was considered and settled, not

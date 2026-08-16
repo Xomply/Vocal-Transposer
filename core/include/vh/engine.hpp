@@ -147,6 +147,13 @@ private:
     std::vector<FrameCount> alignWrite_;
     float alignAmount_ = 0.0f;
 
+    // Per-voice decorrelation delay lines. See Humanization::staticDelayMs and BUGS.md
+    // VH-005: N voices passing the same fricative through unshifted sum coherently, and a
+    // few milliseconds of per-voice offset is what turns that back into an ensemble.
+    std::vector<Sample> decorBuf_;
+    std::vector<FrameCount> decorWrite_;
+    FrameCount decorStride_ = 0;
+
     const IBlendPolicy* blend_ = nullptr;
     FastOnlyPolicy defaultBlend_{};   // used until someone sets a real one
 

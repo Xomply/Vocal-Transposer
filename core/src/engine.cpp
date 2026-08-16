@@ -52,6 +52,15 @@ void Engine::prepare(const EngineConfig& cfg,
     alignBuf_.assign(alignStride_ * static_cast<FrameCount>(kMaxVoices), Sample{0});
     alignWrite_.assign(static_cast<size_t>(kMaxVoices), 0);
 
+    // Per-voice decorrelation line. Sized for the largest static delay any voice can be
+    // given (see noteOn), rounded up to a power of two so the wrap is a mask.
+    FrameCount dneed = static_cast<FrameCount>(cfg_.sampleRate * 0.010) + cfg_.maxBlock;
+    FrameCount dcap = 1;
+    while (dcap < dneed) dcap <<= 1;
+    decorStride_ = dcap;
+    decorBuf_.assign(decorStride_ * static_cast<FrameCount>(kMaxVoices), Sample{0});
+    decorWrite_.assign(static_cast<size_t>(kMaxVoices), 0);
+
     prepared_ = true;
 }
 
@@ -75,10 +84,17 @@ FrameCount Engine::latencySamples() const noexcept {
     const FrameCount lf = (!fast_.empty() && fast_[0]) ? fast_[0]->latencySamples() : 0;
     const FrameCount lq = (!quality_.empty() && quality_[0]) ? quality_[0]->latencySamples() : 0;
 
+    // The per-voice decorrelation delay is real output latency and is included, because a
+    // host doing delay compensation needs the worst case, not the typical one. It is the
+    // largest value noteOn can assign (see the golden-ratio spread there).
+    const FrameCount decor =
+        (cfg_.preservation.unvoiced == UnvoicedPolicy::PassThroughDecorrelated)
+            ? static_cast<FrameCount>(cfg_.sampleRate * 0.004) : 0;
+
     // Parallel engines: max, not sum. The listener hears the fast one first, so the
     // FELT latency is lf; the figure reported here is when the full blend is available,
     // which is what a host needs for delay compensation.
-    return worst + std::max(lf, lq);
+    return worst + std::max(lf, lq) + decor;
 }
 
 int Engine::allocateVoice(int midiNote) noexcept {
@@ -137,7 +153,16 @@ void Engine::noteOn(int midiNote, float velocity) noexcept {
     v.cursor.rngState = static_cast<std::uint32_t>(idx * 2654435761u + 1u);
 
     v.envGain = 0.0f;      // fade in; a voice starting mid-vowel begins at an arbitrary
-    v.envTarget = 1.0f;    // waveform amplitude, and stepping to it clicks
+    v.envPhase = 0.0f;     // waveform amplitude, and stepping to it clicks
+    v.envTarget = 1.0f;
+
+    // Spread the voices over 0.5-4 ms using the golden ratio, so no two delays are a
+    // simple multiple of one another. Equal spacing would put every voice's comb notches
+    // on the same frequencies and colour the ensemble instead of diffusing it. Derived
+    // from the voice INDEX rather than randomised, so a given chord decorrelates the same
+    // way every render and the measurement is reproducible.
+    const double frac = std::fmod(static_cast<double>(idx) * 0.6180339887498949, 1.0);
+    v.hum.staticDelayMs = static_cast<float>(0.5 + 3.5 * frac);
     v.fastRan = false;
     v.qualityRan = false;
 
@@ -307,6 +332,16 @@ void Engine::process(const Sample* in, Sample* out, FrameCount numFrames) noexce
         // Alignment delay on the fast path. Always written to, even at zero delay, so the
         // line stays primed and changing alignAmount_ mid-performance does not read
         // silence.
+        // Decorrelation line for this voice. Zero delay when the policy is plain
+        // PassThrough, which is retained as the A/B control for VH-005.
+        Sample* dline = decorBuf_.data() + static_cast<FrameCount>(i) * decorStride_;
+        const FrameCount dmask = decorStride_ - 1;
+        FrameCount dw = decorWrite_[static_cast<size_t>(i)];
+        const FrameCount decorDelay =
+            (cfg_.preservation.unvoiced == UnvoicedPolicy::PassThroughDecorrelated)
+                ? static_cast<FrameCount>(v.hum.staticDelayMs * 0.001 * cfg_.sampleRate)
+                : 0;
+
         Sample* aline = alignBuf_.data() + static_cast<FrameCount>(i) * alignStride_;
         const FrameCount amask = alignStride_ - 1;
         FrameCount aw = alignWrite_[static_cast<size_t>(i)];
@@ -320,12 +355,39 @@ void Engine::process(const Sample* in, Sample* out, FrameCount numFrames) noexce
             const Sample q = runQuality ? qualityBuf_[k] : 0.0f;
 
             // Envelope slews toward target; a released voice retires only once silent.
-            if (v.envGain < v.envTarget) v.envGain = std::min(v.envTarget, v.envGain + envStep);
-            else if (v.envGain > v.envTarget) v.envGain = std::max(v.envTarget, v.envGain - envStep);
+            //
+            // The RAMP is linear; the applied GAIN is a raised cosine of it, so the gain is
+            // C1 at both ends. Ramping the gain itself was C0: its derivative stepped from
+            // zero to full slope at the start of every attack and every release, which is a
+            // kink, and a kink clicks however long the ramp is. This is the same rule the
+            // rest of the codebase already follows and the one place that did not.
+            // Recomputed ONLY while the envelope is actually moving. A sustained voice
+            // sits at phase 1 for seconds at a time and a transcendental per sample per
+            // voice is not free: 16 voices at a 128-sample block is 2048 cosines that
+            // would all return the same number. Measured at 4 ms of ramp per note against
+            // seconds of sustain, this branch is taken essentially never.
+            if (v.envPhase != v.envTarget) {
+                if (v.envPhase < v.envTarget) v.envPhase = std::min(v.envTarget, v.envPhase + envStep);
+                else                          v.envPhase = std::max(v.envTarget, v.envPhase - envStep);
+                v.envGain = static_cast<float>(0.5 - 0.5 * std::cos(M_PI * v.envPhase));
+            }
 
-            out[k] += (fastOut * w.fast + q * w.quality) * v.gain * v.envGain;
+            // PER-VOICE STATIC DELAY, applied AFTER the blend so both engines receive the
+            // identical treatment. Applying it inside a shifter would give the fast and
+            // quality paths different offsets and comb them against each other, which is
+            // the opposite of the intent. See Humanization::staticDelayMs for why a delay
+            // and not an allpass.
+            Sample mixed = fastOut * w.fast + q * w.quality;
+            if (decorDelay > 0) {
+                dline[dw & dmask] = mixed;
+                mixed = dline[(dw - decorDelay) & dmask];
+            }
+            ++dw;
+
+            out[k] += mixed * v.gain * v.envGain;
         }
         alignWrite_[static_cast<size_t>(i)] = aw;
+        decorWrite_[static_cast<size_t>(i)] = dw;
 
         // FREEZE. The cursor loops within the captured window instead of chasing the write
         // head. Note there is no branch anywhere else in this function for it, and none at

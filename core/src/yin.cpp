@@ -36,6 +36,10 @@ void YinAnalyzer::prepare(double sampleRate, FrameCount /*maxBlock*/) {
     frame_ = AnalysisFrame{};
     nextAnalysisPos_ = 0;
     holdSamples_ = 0;
+    trackedPeriod_ = 0.0f;
+    pendingPeriod_ = 0.0f;
+    pendingCount_ = 0;
+    unvoicedRun_ = 0;
 }
 
 // Scan every new sample through the epoch tracker.
@@ -207,7 +211,58 @@ void YinAnalyzer::process(const AudioRing& ring, Pos upTo) noexcept {
         if (!ring.read(winStart, window_.data(), windowSamples_)) break;
 
         float conf = 0.0f;
-        const float period = estimatePeriod(window_.data(), windowSamples_, conf);
+        const float raw = estimatePeriod(window_.data(), windowSamples_, conf);
+
+        // ---- F0 MOMENTUM -------------------------------------------------------
+        //
+        // `raw` is this hop's opinion. `period` is what we are willing to act on. They
+        // differ only when the opinion is a large jump that nothing has corroborated.
+        //
+        // On ACQUISITION (nothing tracked yet) the first estimate is committed outright:
+        // there is no momentum to weigh it against, and making a note entry wait for
+        // corroboration would add the one latency this project spends everything to
+        // avoid. Momentum guards the middle of a phrase, not its beginning.
+        float period = 0.0f;
+        if (raw > 0.0f) {
+            if (trackedPeriod_ <= 0.0f) {
+                trackedPeriod_ = raw;
+                pendingCount_ = 0;
+                period = raw;
+            } else {
+                const float cents = std::fabs(1200.0f * std::log2(raw / trackedPeriod_));
+                if (cents <= cfg_.maxStepCents) {
+                    trackedPeriod_ = raw;
+                    pendingCount_ = 0;
+                    period = raw;
+                } else {
+                    // A leap. Corroboration means the NEXT hop agreeing with the
+                    // candidate, not merely disagreeing with the tracked value again —
+                    // otherwise two unrelated wrong estimates would confirm each other.
+                    const bool agrees =
+                        pendingCount_ > 0 && pendingPeriod_ > 0.0f &&
+                        std::fabs(1200.0f * std::log2(raw / pendingPeriod_)) <= cfg_.maxStepCents;
+                    pendingPeriod_ = raw;
+                    pendingCount_ = agrees ? pendingCount_ + 1 : 1;
+
+                    if (pendingCount_ >= cfg_.jumpConfirmHops) {
+                        trackedPeriod_ = raw;
+                        pendingCount_ = 0;
+                        period = raw;
+                    } else {
+                        // Not yet believed. Carry the tracked value forward — a confident
+                        // hop, so this is NOT the unvoiced hold and must not consume the
+                        // hold budget.
+                        period = trackedPeriod_;
+                    }
+                }
+            }
+        }
+
+        // ---- THE VOICING GATE --------------------------------------------------
+        // Immediate to voiced, delayed to unvoiced. See YinConfig::releaseHops.
+        if (raw > 0.0f) unvoicedRun_ = 0;
+        else if (unvoicedRun_ < cfg_.releaseHops) ++unvoicedRun_;
+        const bool gateVoiced = unvoicedRun_ < cfg_.releaseHops;
 
         // Copy rather than default-construct: the epoch history accumulated by
         // scanEpochs() lives in frame_ and must survive the F0 update.
@@ -224,9 +279,10 @@ void YinAnalyzer::process(const AudioRing& ring, Pos upTo) noexcept {
         } else if (cfg_.holdThroughUnvoiced && frame_.f0Hz > 0.0f && holdSamples_ < maxHoldSamples_) {
             // THE HOLD. See yin.hpp and the latency analysis: this is what stops every
             // consonant from re-paying the acquisition cost. The pitch is carried
-            // forward, flagged as held, and the voicing is still honestly reported as
-            // unvoiced so the unvoiced-passthrough path still triggers.
-            f.voicing = Voicing::Unvoiced;
+            // forward, flagged as held, and the voicing reflects the GATE — during the
+            // release window it is still Voiced, so a momentary dropout does not toggle
+            // the shifters' handover, and after it the unvoiced path takes over as before.
+            f.voicing = gateVoiced ? Voicing::Voiced : Voicing::Unvoiced;
             f.f0Hz = frame_.f0Hz;
             f.periodSamples = frame_.periodSamples;
             f.confidence = 0.0f;
@@ -235,8 +291,14 @@ void YinAnalyzer::process(const AudioRing& ring, Pos upTo) noexcept {
         } else {
             f.voicing = Voicing::Unvoiced;
             f.f0Hz = 0.0f;
+            f.periodSamples = 0.0f;
             f.confidence = 0.0f;
             f.f0IsHeld = false;
+            // The hold has been abandoned, so the tracked pitch is stale. Dropping it
+            // means the next entry re-acquires rather than being dragged toward whatever
+            // was sung before the silence — momentum must not survive a lost lock.
+            trackedPeriod_ = 0.0f;
+            pendingCount_ = 0;
         }
 
         frame_ = f;

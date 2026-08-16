@@ -254,8 +254,17 @@ TEST_CASE("voicing.enabled = false is BIT-IDENTICAL to the engine before the pro
     PreservationSpec off;
     off.voicing.enabled = false;
 
-    PreservationSpec zeroK;            // the other way of spelling mu == 1
+    // The other way of spelling "the profile does nothing". BOTH exponents must be zero.
+    //
+    // THIS TEST WAS WRONG ON FIRST RUN and the mistake is worth keeping, because it is the
+    // same one the F0-hold test made: I set only muStrength = 0 and asserted equality with
+    // enabled = false. They differ, correctly — the profile carries TWO independent
+    // corrections and zeroing the formant curve leaves the open-quotient tilt running. The
+    // failure was the test asserting that the profile is one knob when the whole point of
+    // VOICE-MODEL.md §2 is that these rows are independent.
+    PreservationSpec zeroK;
     zeroK.voicing.muStrength = 0.0f;
+    zeroK.voicing.tiltStrength = 0.0f;
 
     PsolaShifter a, b;
     const auto oa = render(a, in, 0.5, &off);

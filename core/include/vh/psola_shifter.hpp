@@ -61,6 +61,9 @@ private:
     void placeGrain(const AudioRing& ring, Pos centre, Pos sourceEpoch,
                     FrameCount halfOut, double mu, float gain) noexcept;
 
+    void applySourceTilt(const ShiftRequest& req, const AnalysisFrame& a,
+                         double ratio, FrameCount n) noexcept;
+
     double sampleRate_ = 48000.0;
 
     // Overlap-add accumulator, addressed by absolute position modulo its size.
@@ -98,6 +101,20 @@ private:
 
     FrameCount latency_ = 0;
     FrameCount maxHalf_ = 0;
+
+    // Open-quotient correction state: a one-pole lowpass whose output is recombined with
+    // the input to form a first-order shelf. Per SHIFTER, therefore per voice — two voices
+    // at different intervals need different corners, and sharing this state would smear
+    // one voice's filter across another's audio.
+    //
+    // tiltPrimed_ is deliberately cleared whenever the filter is bypassed (unvoiced,
+    // backstop, no F0) so that re-entry snaps the coefficients to their target instead of
+    // slewing from stale values that relate to audio from before the gap. Same reasoning
+    // as Engine's shifter re-entry reset.
+    double tiltLp_ = 0.0;
+    double tiltG_ = 1.0;
+    double tiltK_ = 0.0;
+    bool tiltPrimed_ = false;
 
     // Hann window, precomputed at unit length and sampled by normalised position, so
     // changing grain size with F0 costs no recomputation.

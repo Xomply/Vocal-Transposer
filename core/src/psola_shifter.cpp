@@ -46,6 +46,10 @@ void PsolaShifter::reset() noexcept {
     started_ = false;
     lastGrainPos_ = 0;
     haveGrain_ = false;
+    tiltLp_ = 0.0;
+    tiltG_ = 1.0;
+    tiltK_ = 0.0;
+    tiltPrimed_ = false;
 }
 
 // Read the ring at a FRACTIONAL offset from an anchor position.
@@ -112,6 +116,53 @@ void PsolaShifter::placeGrain(const AudioRing& ring, Pos centre, Pos sourceEpoch
         ola_[(centre + static_cast<Pos>(static_cast<std::int64_t>(k))) & olaMask_] +=
             s * w * gain;
     }
+}
+
+// A4 — the open-quotient correction. See vh/voicing.hpp for the derivation and
+// VOICE-MODEL.md §5 for why it is a separate row from the mu warp.
+//
+// THE ONE-LINE VERSION: a copied grain keeps its excitation's ABSOLUTE duration while the
+// output period grows by 1/ratio, so the open quotient collapses by ratio and the source
+// becomes an impulse train. A real voice holds its open quotient roughly constant across
+// pitch, so its excitation's spectral corner scales WITH the target F0. The difference
+// between those two is a first-order shelf: darker going down, brighter going up.
+//
+// WHAT THIS IS NOT: a source model. It is the first-order spectral consequence of one,
+// applied to the output, chosen because it costs a one-pole filter and no new machinery.
+// The exact answer needs an LPC residual/filter split. Set tiltStrength = 0 to measure
+// how much of the VH-008 buzz this accounts for versus the truncated ring.
+//
+// WHY THE COEFFICIENTS ARE INTERPOLATED ACROSS THE BLOCK: in Mode A the ratio moves with
+// the sung pitch, so both the corner and the shelf gain move every block. Stepping a
+// filter coefficient at a block boundary is a discontinuity in the output — the same
+// class of defect as a crossfade with a kink, and it clicks for the same reason.
+void PsolaShifter::applySourceTilt(const ShiftRequest& req, const AnalysisFrame& a,
+                                   double ratio, FrameCount n) noexcept {
+    const VoicingProfile& vp = req.preservation->voicing;
+
+    const double gTarget = vp.tiltGainFor(ratio);
+    const double cornerHz = vp.tiltCornerHz(static_cast<double>(a.f0Hz), ratio);
+
+    // No F0 anchor means no open quotient to correct. Bypass rather than guess.
+    if (cornerHz <= 1.0 || std::abs(gTarget - 1.0) < 1e-6) { tiltPrimed_ = false; return; }
+
+    const double fc = std::clamp(cornerHz, 20.0, 0.45 * sampleRate_);
+    const double kTarget = 1.0 - std::exp(-2.0 * M_PI * fc / sampleRate_);
+
+    if (!tiltPrimed_) { tiltG_ = gTarget; tiltK_ = kTarget; tiltPrimed_ = true; }
+
+    const double dG = (gTarget - tiltG_) / static_cast<double>(n > 0 ? n : 1);
+    const double dK = (kTarget - tiltK_) / static_cast<double>(n > 0 ? n : 1);
+
+    for (FrameCount i = 0; i < n; ++i) {
+        tiltG_ += dG;
+        tiltK_ += dK;
+        const double x = static_cast<double>(req.out[i]);
+        tiltLp_ += tiltK_ * (x - tiltLp_);
+        req.out[i] = static_cast<Sample>(tiltLp_ + tiltG_ * (x - tiltLp_));
+    }
+    tiltG_ = gTarget;
+    tiltK_ = kTarget;
 }
 
 void PsolaShifter::process(const ShiftRequest& req) noexcept {
@@ -295,7 +346,15 @@ void PsolaShifter::process(const ShiftRequest& req) noexcept {
         : std::numeric_limits<double>::infinity();
     if (sinceGrain > 2.0 * synthSpacing + static_cast<double>(halfOut)) {
         ring.read(c, req.out, n);
+        // Do NOT tilt the backstop's output. It is unshifted source, so its open quotient
+        // is already the source's own and correct for the source's pitch; tilting it would
+        // colour the one path in this engine that is meant to be transparent.
+        tiltPrimed_ = false;
+        if (!cur.frozen) cur.next += n;
+        return;
     }
+
+    applySourceTilt(req, a, ratio, n);
 
     if (!cur.frozen) cur.next += n;
 }

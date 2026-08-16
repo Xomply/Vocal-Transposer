@@ -650,3 +650,49 @@ spectrogram-and-waveform grids, all four configs side by side per cell.
 4. Sweep the exponent by hand where it matters:
    `./build/vh_sweep in.wav out.wav psola -12 0.5 1` — muStrength 0.5 is halfway between
    holding formants and the derived curve.
+
+---
+
+## Milestone 2, continued — listening test on real recordings, VH-008 closed
+
+*Everything above this point (mu confirmation, C1 non-result, clipping) was measured on
+the synthetic probe tones. This section is the listening test on the two real recordings
+already in the repo, produced with:*
+
+```bash
+./tools/fetch_test_audio.sh .
+python3 tools/model_sweep.py ./build/vh_sweep sweepout/ sustained_dry.wav melody_dry.wav \
+    --intervals -24 -12 -5 5 12 19
+```
+
+**Result: confirmed, unambiguously, by ear.** `mu+tilt` (the full voicing profile) is a
+large improvement over `hold` (the pre-profile engine) at every interval tested on both
+recordings — the soprano (~805 Hz, sustained, natural vibrato) and the Carnatic melody
+(~276 Hz, moving pitch, tambura in the background). Most audible exactly where VH-008 was
+opened: −24 and −12 st.
+
+This closes VH-008. It does **not** close VH-010 — nothing here separates how much of the
+improvement is the open-quotient correction versus how much is that mu also lengthens the
+grain and so partly mitigates the still-truncated ring. It also is not a comparison against
+option 2 (blend-tilt toward the granular engine) or option 1 (a source-filter engine), only
+against the engine as it stood before this milestone. The claim is "this is a real
+improvement", not "this is the best available fix".
+
+## A probe-tool limitation, found by this listening test
+
+The soprano source shifted up +12 and +19 st puts the output fundamental above 1.6 kHz,
+past `voice_probe.py`'s 1400 Hz ceiling (`estimate_f0`'s default `fmax`). The tool locks
+onto a subharmonic and reports garbage — cents error around −1200 to −1900, which reads as
+a catastrophic octave failure and is not one; the rendered audio is fine. Anyone re-running
+this sweep on high sopranos should raise `fmax` or discard those two cells' pitch column
+and trust their ears. Not filed as a BUGS.md entry because it is a measurement-tool ceiling
+with an obvious cause, not an open question — but recorded here so the next person doesn't
+re-diagnose it as an engine regression.
+
+## Listening material
+
+`sustained_dry_listening_demo.wav` and `melody_dry_listening_demo.wav` (not committed —
+generated audio, same reasoning as `ATTRIBUTION.txt` for the source recordings): dry
+reference, then six intervals from −24 to +19 st, `hold` immediately followed by `mu+tilt`
+at each, so the A/B sits adjacent rather than scattered across the file. Regenerate with
+the commands above; `tools/model_sweep.py`'s output naming makes the pairing mechanical.

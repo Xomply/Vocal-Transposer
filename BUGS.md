@@ -150,96 +150,28 @@ catch it.
 ---
 
 ### VH-008 — large downward shifts are a PULSE TRAIN, not a lower voice ("square wave")
-**Status:** In review | **Severity:** S2 | **Area:** `core/src/psola_shifter.cpp` | **Owner:** —
+**Status:** Done | **Severity:** S2 | **Area:** `core/src/psola_shifter.cpp`
 
-**PARTIALLY ADDRESSED, AWAITING LISTENING TESTS. The diagnosis below was half right and the
-half it got wrong is the more actionable half.**
+Fixed and confirmed by listening. `duty = 2 * ratio` was measuring the **open quotient
+collapsing**, not a gap needing filling — a PSOLA grain is copied verbatim, so the
+excitation keeps its absolute duration while the output period grows by `1/ratio`. The
+buzz had two causes: the collapsed open quotient (source) and the truncated tract ring
+(still open, see VH-010).
 
-`duty = 2 * ratio` is correct, and it is measuring the **open quotient collapsing**, not a
-gap needing filling. A PSOLA grain is copied verbatim, so the EXCITATION keeps its absolute
-duration while the output period grows by `1/ratio`. At -24 st a soprano's ~0.6 ms open
-phase sits inside a 20 ms period: open quotient ~0.03. That is an impulse train, and an
-impulse train has energy at every multiple of its rate — which is the dense harmonic comb
-this entry reports. **The buzz has two causes, not one:** the collapsed open quotient (a
-SOURCE problem) and the truncated tract ring (option 1 below).
+Two corrections in milestone 2: the mu warp (raises duty exactly as predicted, zero cents
+of pitch movement — measured in `RESULTS.md`) and the source tilt shelf (approximates
+holding the open quotient constant across F0).
 
-Two corrections landed, both in milestone 2:
+**Listening test, real recordings (not the synthetic probes), −24 st through +19 st on
+both `sustained_dry.wav` and `melody_dry.wav`:** confirmed a large, unambiguous
+improvement — "mu+tilt is much much better" than the pre-profile engine at every interval
+tested, most audibly at −24 and −12 st, which is exactly where this entry was opened.
 
-- **mu warp.** Resampling grain content by `mu = ratio^0.3` stretches the grain by `1/mu`,
-  so `duty = 2 * ratio / mu`. Measured at -24 st on a 242 Hz probe: duty 0.31 -> 0.47, a
-  factor of 1.52 against a predicted 1/mu of 1.52, **with zero cents of pitch movement**.
-- **Source tilt shelf.** A first-order approximation of holding the open quotient constant.
-
-**Before this can move to Done:** listen. Both corrections are timbre changes and no metric
-in the harness can tell "less buzzy" from "darker". `sweepout/wav/probe_242hz__-24st__*`
-is the A/B. Set `tiltStrength = 0` to hear the two corrections separately.
-
-**Still open:** ring truncation. See VH-010 for why it could not be measured.
-**Found:** by ear, listening to the regenerated VH-001 sweeps: the pitch is right but it
-"sounds like a square wave — the grain does not fill the period". Characterised with
-`tools/inspect_audio.py`, which was written for this.
-
-**Symptom.** Below −12 st the output is a short burst of voice followed by flat silence,
-repeating at the correct rate. The *pitch* is correct (VH-001 is genuinely fixed); the
-*timbre* is a buzz. A pulse train has energy at every multiple of its rate, so the
-spectrogram shows a dense harmonic comb to 8 kHz where the unshifted signal shows a few
-formant bands — which is the square-wave quality, heard exactly.
-
-**Repro.**
-```bash
-python3 tools/inspect_audio.py sweep/sweep_sustained_psola.wav --from 11.2 --to 16.2
-python3 tools/inspect_audio.py sweep/sweep_sustained_psola.wav --from 11.2 --to 16.2 --png inspect/
-```
-The waveform view is the one that shows it: bursts with dead-flat gaps between.
-
-**Measurement.** Duty cycle — fraction of each output period carrying energy:
-
-| shift | ratio | duty measured | duty predicted (`2 x ratio`) |
-|---|---|---|---|
-| 0 st | 1.000 | 1.00 | 1.00 (capped) |
-| −12 st | 0.500 | 1.00 | 1.00 (capped) |
-| −24 st | 0.250 | 0.53 | 0.50 |
-| −36 st | 0.125 | 0.27 | 0.25 |
-
-**Root cause. Fully understood, and it is geometry, not a defect in the code.** A PSOLA
-grain is two analysis periods wide and is emitted every `period / ratio` samples, so the
-fraction of the output period it covers is
-
-```
-duty = grain_length / spacing = 2 * period / (period / ratio) = 2 * ratio
-```
-
-Gap-free therefore holds exactly while `ratio >= 0.5` — **down to −12 semitones and no
-further**. Below that the grain physically cannot reach the next one. Measurement matches
-the formula to within 3%.
-
-**Why it CANNOT be fixed by widening the grain.** That is VH-001. A wider grain reaches
-past the next source glottal pulse and drags the source periodicity back in, which is how
-the output ended up at the source pitch in the first place. The two failures are the same
-trade-off seen from opposite sides: narrow grains give correct pitch with gaps, wide grains
-give no gaps at the wrong pitch. **There is no grain width that gives both.** This is the
-real reason TD-PSOLA is described as limited to modest downward shifts — a sharper statement
-than the "±6 semitones" of VH-007, and in the opposite direction.
-
-**Options, in order of honesty.** *(1 and 3 stand; 2 is now less urgent because mu raises
-duty without giving up formant preservation, which is what option 2 was buying.)*
-1. **Source-filter engine (WORLD or LPC) — the actual answer.** The gap exists because a
-   copied grain has no way to ring. A vocal-tract filter excited at the new rate rings
-   naturally and fills the gap with the right spectrum. This is already the top roadmap
-   item in `HANDOVER.md` §7, and this measurement is the strongest argument for it yet:
-   it is not a quality refinement, it is what makes octave-down possible at all.
-2. **Blend policy — available today, ~20 lines, no new DSP.** `IBlendPolicy` is
-   runtime-swappable by design. The granular engine resamples and therefore has NO gaps at
-   any ratio; it merely moves formants. Below −12 st the trade flips: chipmunk-in-reverse
-   is less objectionable than a buzz. A policy weighting the fast engine up as ratio falls
-   below 0.5 uses machinery that already exists. This is the cheapest real improvement.
-3. **Synthetic decay tail** (extrapolate the grain's own ringing into the gap). A crude
-   resonator bolted onto a time-domain method. Would work; would also be a worse version of
-   option 1 built by accident.
-
-**Regression test when this is addressed.** `duty_cycle()` in `tools/inspect_audio.py` is
-the metric. Note it must be paired with a pitch assertion — driving duty to 1.0 alone is
-trivially achieved by reintroducing VH-001.
+What this listening test does NOT establish: how much of the improvement is the open
+quotient versus the still-truncated ring (VH-010 remains open, because no metric here
+separates them), and it was A/B against `hold`, not against option 2's blend-tilt
+fallback or option 1's source-filter engine — so it says the correction *works*, not that
+it is the *best available* fix. Recorded as the honest scope of the result.
 
 ---
 
@@ -470,8 +402,8 @@ documents later. `VOICE-MODEL.md` C1 is marked unverified; this entry is why.
 
 # Done
 
-*VH-003 landed with measurements in `RESULTS.md` milestone 2; its stub is above. VH-001,
-VH-006, VH-008 and VH-009 are fixed and in review — they move here once someone has
+*VH-003 and VH-008 landed with measurements and a listening test in `RESULTS.md`
+milestone 2; their stubs are above. VH-001, VH-006 and VH-009 are fixed and in review — they move here once someone has
 listened to the regenerated sweeps and confirmed the reintroduced inter-pulse gaps are
 acceptable. Bugs fixed before this ledger existed are written up in `RESULTS.md` — seven of
 them, each with a symptom that pointed away from its cause.*

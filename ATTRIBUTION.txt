@@ -27,3 +27,44 @@ before processing.
 
 Licences are those of the original Freesound uploads; consult the essentia-audio
 repository and the Freesound entries before redistributing the dry material.
+
+
+Demo recordings (milestone 3)
+=============================
+
+Two further real voices, chosen because neither resembles the two validation
+recordings above and because between them they cover the failure modes the
+milestone-3 work targeted. Prepared by tools/fetch_test_audio.sh.
+
+flamenco_dry   — 14 s of flamenco cante, from "flamenco.flac" in the MTG
+                 essentia-audio corpus (Creative Commons material from
+                 Freesound). Male, roughly 157-390 Hz, chest register, heavy
+                 melisma and rapid pitch movement, with guitar behind the voice.
+
+                 Chosen as the SINGING case. It is the hardest available
+                 material for the epoch tracker and for VH-002: the pitch almost
+                 never holds still.
+
+speech_dry     — 30 s assembled from the Free Spoken Digit Dataset
+                 (github.com/Jakobovski/free-spoken-digit-dataset, CC BY-SA 4.0),
+                 speaker "theo", digits 0-9 in shuffled order with 120 ms gaps.
+                 Male, roughly 110-190 Hz.
+
+                 Chosen as the CONSONANT case, and it is assembled rather than
+                 found because no recording in the corpus has this density of
+                 plosives and fricatives. Spoken digits happen to cover the exact
+                 phonemes the reported symptom named: /k/ and /s/ in "six", /t/
+                 in "two" and "eight", /f/ in "four" and "five", /v/ in "seven",
+                 /th/ in "three". A voiced-unvoiced boundary every few hundred
+                 milliseconds is precisely the condition that made the old hard
+                 switch audible.
+
+                 CAVEAT, stated because it limits what this file can show: the
+                 source is 8 kHz, so it carries no energy above 4 kHz. Sibilant
+                 energy is therefore under-represented and the sibilant-collapse
+                 figures measured on it are, if anything, conservative. It is
+                 upsampled to 48 kHz for the pipeline, which does not put the
+                 missing band back.
+
+Licences are those of the original uploads. Consult the essentia-audio
+repository, the Freesound entries and the FSDD repository before redistributing.

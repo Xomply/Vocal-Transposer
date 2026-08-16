@@ -64,6 +64,7 @@ core/include/vh/
   shifter.hpp        IPitchShifter + ReadCursor. Freeze lives in the cursor.
   granular_shifter.hpp  FAST path. Resamples; pitch-synchronous jumps kill the comb.
   psola_shifter.hpp     QUALITY path. Formants preserved by construction.
+                        `mix_` is the grain/passthrough handover: a crossfade, not a branch.
   passthrough_shifter.hpp   Identity shifter: test oracle and safe fallback.
   voice.hpp          Voice state, RatioSource (the mode switch), Humanization.
   blend.hpp          IBlendPolicy. THE dial.
@@ -72,11 +73,17 @@ core/include/vh/
 core/src/            rt.cpp, yin.cpp, granular_shifter.cpp, psola_shifter.cpp, engine.cpp
 offline/             WAV in -> WAV out. No audio hardware.
 tools/               voice.hpp (synthetic singer), demo.cpp (audio), bench.cpp (perf+quality)
-tests/               doctest + the allocation detector. 37 cases.
+tests/               doctest + the allocation detector. 48 cases, six of them
+                     pinning that no path switch is a branch (test_continuity.cpp).
 app/                 JUCE shell. NOT YET WRITTEN — see "what's open".
 ```
 
-**Milestone 1 is reached: the principles work.** Measured evidence in `RESULTS.md` —
+**Milestone 3 is reached.** The principles work AND the output no longer steps. Isolated
+clicks across the regression grid 99 → 19; sibilant ensemble collapse 0.82 → 0.13 on real
+singing; the formant warp confirmed applied to within 2.4%. Four real recordings, 48 tests,
++5% CPU. See `RESULTS.md`.
+
+**Milestone 1 was reached earlier: the principles work.** Measured evidence in `RESULTS.md` —
 worst-case pitch error 4.2 cents, 16 voices through both engines at 12% of a 64-sample
 callback budget, and harmony notes absent from the input appearing at 112-157x their dry
 level. Four significant bugs were found and fixed by measurement; all four are written up
@@ -102,6 +109,12 @@ host to check a windowing change.
 | No allocation on the audio thread, **enforced by test** | Dropout-free operation under load |
 | Freeze = a cursor that stops advancing | Freeze needing no support in ring or shifters |
 | Blend is a continuous C¹ crossfade, never a switch | Inaudible handover; the user's stated requirement |
+| **No path switch anywhere is a branch** | Every click found in milestone 3. A mode flag in an audio path is a click waiting for a consonant |
+| Grain/passthrough handover is a crossfade (`mix_`) | Clean consonants; the single largest click source |
+| Voicing is gated, asymmetrically | No mode chatter; a lyric no longer toggles the handover every few ms |
+| F0 momentum: leaps need corroboration | Every quantity derived from the period staying stable through one bad estimate |
+| Granular fade length snapshotted at fade start | The crossfade envelope staying monotonic while pitch moves |
+| Per-voice static delay on the whole voice | The ensemble not collapsing to mono at every fricative |
 | Equal-gain (not equal-power) blend normalisation | No +3 dB pumping between correlated engines |
 | Hold F0 through unvoiced frames | Mode A staying responsive through sung lyrics |
 | One shifter instance per voice, not shared | Voices not trampling each other's grain state |
@@ -161,10 +174,10 @@ host to check a windowing change.
   reference, which is what PSOLA actually needs, but it is not DYPSA or SEDREAMS and it has
   not been validated against electroglottography. It was already the cause of one
   hard-to-diagnose bug (see `RESULTS.md` #3).
-- **Humanization is declared but not applied.** The `Humanization` struct exists with
-  per-voice detune, vibrato and pan; the Engine does not yet read it. Until it does,
-  N voices are N *identical* shifted copies, which sums toward one flanged voice rather
-  than a choir. This is the cheapest large improvement available.
+- **Humanization is mostly not applied.** The Engine now reads exactly one row —
+  `staticDelayMs`, which fixes the sibilant collapse — and ignores per-voice detune,
+  vibrato, timing jitter and pan. N voices still differ only in pitch and delay. The wiring
+  to read the struct exists now, so adding the rest is smaller than it was.
 - **`envelopeWarp` is unused** — resolved in milestone 2, and the fix was smaller than the
   wait implied. `VoicingProfile` replaces the constant with `mu = ratio^0.3` (derived from
   population data, and reproducing the literature's 0.8 at an octave), and `PsolaShifter`
@@ -199,12 +212,10 @@ host to check a windowing change.
 
 ### Needs design (think before coding)
 
-6. **Sibilant polyphonic collapse — now MEASURED, still unsolved.** Passing fricatives
-   through unshifted is correct per voice, but N voices emit N *identical* copies, which
-   sum to one mono burst. In the demo the fricative region reads 1.7x the dry energy with
-   four voices, and it is audibly the worst part of the output.
-   `UnvoicedPolicy::PassThroughDecorrelated` is the placeholder; the fix (per-voice
-   allpass, micro-delay, or mild spectral warp) is unwritten.
+6. **Sibilant polyphonic collapse — FIXED in milestone 3.** A per-voice static delay,
+   golden-ratio spread, applied to the whole voice after the blend. Collapse 0.82 → 0.13 on
+   real singing. `BUGS.md` VH-005 has the measurement and the reason the allpass this was
+   originally going to be was rejected.
 7. **Frozen-voice looping.** A fixed-period loop buzzes audibly within ~1 s. Needs
    randomised grain selection plus slow per-voice detune drift. `ReadCursor::rngState`
    is seeded per voice for this and otherwise unused.
@@ -225,7 +236,7 @@ host to check a windowing change.
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build -j
-./build/vh_tests                              # 37 cases
+./build/vh_tests                              # 48 cases
 ./build/vh_bench                              # CPU, pitch accuracy, latency
 ./build/vh_demo ./audio                       # render dry + wet listening material
 ./build/vh_render take.wav out/ mytake "0:60,64,67; 2:59,62,67" 60   # your own recording

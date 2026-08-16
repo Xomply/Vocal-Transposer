@@ -1,4 +1,238 @@
-# Results — Milestone 1: the principles work
+# Results
+
+*Milestone 3 is at the top because it is the most recent. Milestone 1 and the bug log are
+below and are unchanged; nothing in milestone 3 supersedes them.*
+
+---
+
+# Milestone 3: the output stops stepping, and the ensemble stops collapsing
+
+Two defects that had been in `BUGS.md` since they were first heard — VH-002 (clicking) and
+VH-005 (sibilant collapse) — are fixed, measured on four recordings, and pinned by six new
+regression tests. A third deliverable, a harness for tuning `k_mu`, produced the first
+direct confirmation that the engine applies the formant warp it computes.
+
+## What was actually wrong with the clicking
+
+**Neither of VH-002's two recorded candidates.** The entry suspected the epoch tracker and
+stale synthesis spacing. It was four separate places where a decision was made with a branch
+instead of a fade — and the reason it read as a pitch-shifting fault is that a sung lyric
+crosses the voiced/unvoiced boundary twice per consonant, so the symptom presents as "k, t,
+b, p all click".
+
+The entry named the experiment that would have settled it — "log the epoch series and the
+per-block period against click timestamps" — and it had never been run, because the log did
+not exist. `vh_trace` is that log. The first run:
+
+| melody, PSOLA | isolated clicks | at voicing edge | steady |
+|---|---|---|---|
+| +3 st | 14 | **14** | 0 |
+| +7 st | 15 | **15** | 0 |
+| +12 st | 12 | **12** | 0 |
+
+Not "worse at edges". **Only** at edges.
+
+The four causes and their fixes are written up in `BUGS.md` VH-002. In one line each:
+PSOLA chose between grains and passthrough with an `if`; the voicing decision had no
+hysteresis; a single wrong F0 estimate moved every derived quantity for one hop and back;
+and the granular crossfade's length changed underneath a running fade.
+
+## The grid
+
+Two recordings x two engines x five intervals. The "before" column is a **real build of the
+previous commit**, not a runtime flag — a flag can only disable what somebody remembered to
+make switchable.
+
+| | before | after |
+|---|---|---|
+| melody, PSOLA, -12 / -5 / +3 / +7 / +12 st | 16 / 13 / 14 / 15 / 12 | 0 / 0 / 1 / 0 / 1 |
+| melody, granular | 2 / 0 / 2 / 1 / 10 | 1 / 1 / 0 / 0 / 7 |
+| sustained, PSOLA | 2 / 2 / 2 / 1 / 2 | 1 each |
+| sustained, granular | 1 each | 0-1 each |
+| **total** | **99** | **19** |
+
+The sustained recording's floor of 1 is the **dry file's own count** — real material contains
+real transients, so zero is not the target and would indicate the detector was broken.
+
+The one cell still above the floor, `melody/granular/+12` at 7, is logged as VH-011: at
+ratio 2 the granular path needs a jump roughly every period, and each jump is a crossfade
+seam. That is the trade that buys its latency, not a defect.
+
+## Two recordings that had never been used
+
+Both chosen because neither resembles the two validation files, and between them they cover
+the two things milestone 3 targeted. See `ATTRIBUTION.txt`.
+
+**Flamenco cante** — male, ~157-390 Hz, chest register, heavy melisma. The pitch almost
+never holds still, which is the hardest available condition for VH-002.
+
+**Spoken digits** — male, ~110-190 Hz, assembled rather than found, because nothing in the
+corpus has this density of plosives and fricatives. Spoken digits happen to cover the exact
+phonemes the reported symptom named: /k/ and /s/ in "six", /t/ in "two" and "eight", /f/ in
+"four" and "five", /v/ in "seven". A voiced/unvoiced boundary every few hundred
+milliseconds.
+
+| render | before | after | dry source's own count |
+|---|---|---|---|
+| flamenco, PSOLA | 77 | **1** | 1 |
+| flamenco, blend | 77 | **1** | 1 |
+| flamenco, granular | 25 | 15 | 1 |
+| speech, PSOLA | 160 | **7** | 11 |
+| speech, blend | 159 | **7** | 11 |
+| speech, granular | 10 | **3** | 11 |
+
+The speech figures land *below* the dry source's own count, which is not a mistake: the
+harmonised output is built from windowed grains, and grains are smoother than a plosive
+release.
+
+Listening material: `demo/flamenco_reel.wav` (104 s) and `demo/speech_reel.wav` (214 s).
+Each is dry first, then every configuration AFTER immediately followed by the same
+configuration BEFORE on the same passage. After-then-before rather than the reverse, because
+the second of a pair is heard most critically and putting the older build there is the
+harder test. Guides in `demo/*_DEMO.md`.
+
+## The sibilant collapse
+
+**The old number could not have shown a fix.** "The fricative region reads 1.7x the dry
+energy with four voices" is a level, and a level improves if you turn the voices down or
+delete the harmony — the same trap as duty cycle in VH-008 and "no gaps" in VH-006.
+
+The property is COHERENCE. `tools/ensemble_probe.py` measures four voices against **one
+voice** on the same material: four coherent copies give +12.0 dB, four incoherent copies give
++6.0 dB. `collapse` places the result between them, 0 for an ensemble and 1 for four copies
+of one voice. Being a ratio between two renders, a level change moves both and cancels.
+
+| material | before | after |
+|---|---|---|
+| synthetic demo phrase (the 1.7x figure's own material) | 0.79 | **0.41** |
+| flamenco cante | 0.82 | **0.13** |
+| consonant-dense speech | 0.66 | **0.03** |
+
+The fix is a fixed per-voice delay of 0.5-4 ms, golden-ratio spread so no two are a simple
+multiple, applied to the whole voice after the blend. Rationale, and why the allpass this
+entry originally proposed was rejected, in `BUGS.md` VH-005.
+
+**Honest caveat.** The voiced control window moves too, by less (flamenco +10.21 -> +7.62 dB
+against the fricative's +10.98 -> +6.82). The delay is applied to the whole voice by design,
+so it decorrelates everything a little and fricatives a lot. A reader comparing only the
+headline number would conclude the change is fricative-specific, and it is not.
+
+## The mu harness, and what it found
+
+`k_mu` could not be tuned, because nothing measured whether the engine applied the mu it
+computed. `envdist_db` says the envelope MOVED; it cannot tell 0.81 from 0.70.
+
+A formant scale factor is a multiplication on the frequency axis and therefore a translation
+on a LOG frequency axis, so `tools/mu_probe.py` cross-correlates the cepstrally liftered
+envelopes of dry and wet and reports the best translation. Two calibration controls make it
+trustworthy, and both have answers that come from the algorithms rather than from the tool:
+
+| control | must be | measured |
+|---|---|---|
+| granular, -12 / -5 / +7 st | the ratio | 0.498 / 0.747 / 1.421 |
+| PSOLA, muStrength = 0, same | 1.000 | 0.996 / 0.997 / 0.994 |
+
+**The finding: the engine applies its requested mu to within 2.4% mean error across a
+5 x 5 grid of interval and exponent, while pitch stays within ~25 cents everywhere.** That
+independence — mu moves the envelope and does NOT move the pitch — is the entire claim of the
+grain-resampling approach in `VOICE-MODEL.md` §5, and until now it was an argument rather
+than a measurement.
+
+Upward shifts under-deliver mu by 3-7% and large downward exponents slightly over-deliver.
+Not chased; recorded so the next person knows the residual is systematic rather than noise.
+
+**A limit that is real rather than an implementation detail: the probe cannot measure a
+soprano.** A cepstral envelope is only informative where harmonics sample it, and at 814 Hz
+there are barely seven below 6 kHz, so the controls come back 170-200 cents out. At 242 Hz
+they land within 32. This is the same conditioning problem `VOICE-MODEL.md` §5 records for
+LPC at high F0, and it is not a coincidence. **Tune `k_mu` on low-pitched material; the
+soprano is for listening.**
+
+## Cost
+
+| | before | after |
+|---|---|---|
+| 16 voices, PSOLA, 128, mean us | 222 | 234 |
+| 16 voices, both engines, 64, mean us | 128 | 132 |
+
+**+5%.** Measured against the previous build in the same container on the same run, because
+the absolute figures in milestone 1 were taken under different load and are not comparable.
+
+Two-thirds of the overhead was self-inflicted and removed: a transcendental per sample per
+voice, once in the handover crossfade and once in the Engine envelope. Both are now computed
+only while the thing they shape is actually moving. Before that, 16 voices at a 128-sample
+block went from 12% to 37% of budget — 2048 cosines per block that almost always returned
+the same number.
+
+## Mistakes made and caught, in one place
+
+Recorded because each is a trap the next person can walk into, and all four were caught by
+measurement rather than by reading.
+
+**A fix that was worse than the bug.** For the granular fade length, deferring
+`updateGeometry` until no fade was in flight. At ratio 2 the fade occupies half the time
+between jumps, so block boundaries keep landing inside one, the update starves for many
+blocks and then arrives all at once — a bigger step than the one being avoided. The geometry
+must keep updating; it is the FADE that must be insulated from it. Recorded in the header so
+it is not retried.
+
+**A time constant off by the block size.** The geometry smoother's one-pole coefficient was
+derived from the sample rate, but `updateGeometry` runs once per BLOCK — so 20 ms became
+2.5 seconds, the geometry never caught up with the singer, and the granular pitch test failed
+by 1971 cents. Caught in one run by a test suite that needs no audio hardware, which is the
+whole argument for `core` linking no framework.
+
+**The same performance mistake twice.** A `cos` per sample per voice, first in the handover
+and then, independently, in the Engine envelope. See Cost above.
+
+**A test signal that contained the defect it was testing for.** The first continuity tests
+concatenated a mid-cycle tone straight onto full-scale white noise, which is a step in the
+SOURCE. The shifter passed it through faithfully and the test blamed the shifter — every
+"failure" was one cluster of samples at the join, delayed by exactly the shifter's latency.
+`tools/voice.hpp` already recorded this lesson for the synthetic singer. The joins are now
+crossfaded.
+
+**A detector that flagged correct behaviour.** The original click counts were partly false
+positives: at -12 st, 89 of 184 "clicks" were the shifter's own glottal pulses, because a
+rolling median taken across the inter-pulse silence the VH-001 fix correctly restored is
+tiny. Verified by hand — max|dx| over local peak of 0.02-0.21, smooth band-limited rises. The
+threshold was NOT lowered, because that would have broken comparability with the counts
+already in the ledger; a step-ratio gate was added alongside it, derived rather than tuned.
+An absolute step-ness test on its own was tried first and rejected: dry melody scores 479
+samples above it, because tambura and consonants genuinely contain fast slopes.
+
+## New tools
+
+| tool | what it is for |
+|---|---|
+| `vh_trace` | `vh_sweep` plus a per-block CSV of the analyser's state. No changes to `core`; the audio path is bit-identical. |
+| `tools/click_probe.py` | Finds discontinuities and attributes each to what the engine was doing. |
+| `tools/click_sweep.py` | The click regression as one command, with `--compare` for deltas. |
+| `tools/ensemble_probe.py` | Coherence of N voices against one. Auto-classifies voiced/unvoiced frames. |
+| `tools/mu_probe.py` | Achieved formant scale factor, with `--selftest` calibration. |
+| `tools/mu_sweep.py` | Requested vs achieved mu across a k grid, plus listening renders. |
+| `tools/demo_reel.py` | Builds an A/B listening reel and its guide from two builds. |
+
+## New tests
+
+`tests/test_continuity.cpp`, six cases, all pinning claims that would otherwise rot silently:
+PSOLA and granular hand over without stepping; a pitch step does not put a step in the
+output; the voicing gate rides through a dropout; voicing attack stays immediate; F0 momentum
+rejects an excursion but accepts a real leap; N voices do not sum coherently on unvoiced
+material — that last one also asserting the control still reproduces the defect, so it cannot
+pass by the fix having been quietly disabled.
+
+One existing test was changed. `"reported latency reflects the mode"` asserted
+`b->latencySamples() == 0`, which was a PROXY for "Mode B pays no analyser cost" that held
+only because Mode B with no shifters had no other latency. The per-voice decorrelation delay
+added a term to both modes and the proxy failed while the claim stayed true. It now asserts
+the difference between the modes equals the analyser's latency, so anything common to both
+cancels. `HANDOVER.md` §6's "measure the thing, not a proxy for it", recurring for the third
+time in this repository.
+
+---
+
+# Milestone 1: the principles work
 
 *Updated after testing on REAL recordings. Three further bugs surfaced within minutes of
 using real audio that 36 synthetic tests had missed entirely — see "Bugs found on real

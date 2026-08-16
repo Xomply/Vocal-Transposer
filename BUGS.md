@@ -176,48 +176,86 @@ it is the *best available* fix. Recorded as the honest scope of the result.
 ---
 
 ### VH-002 — clicks on the quality path when the source pitch moves quickly
-**Status:** Backlog | **Severity:** S2 | **Area:** `core/src/psola_shifter.cpp`, `core/include/vh/epoch.hpp` | **Owner:** —
-**Found:** reported by ear while auditioning the octave sweep; reproduced by measurement.
+**Status:** Done | **Severity:** S2 | **Area:** `core/src/psola_shifter.cpp`, `core/src/granular_shifter.cpp`, `core/src/yin.cpp`, `core/src/engine.cpp`
 
-**Symptom.** Audible clicking during melodic movement. Absent on sustained notes. Present
-across shift amounts, so it is not a large-shift artefact.
+Fixed, with measurements. **Neither of the two candidate causes recorded here was right**,
+which is the main thing worth carrying forward: this entry suspected the epoch tracker and
+stale synthesis spacing, and the answer was four separate places where a decision was made
+with a branch instead of a fade.
 
-**Repro.**
-```bash
-./build/vh_sweep melody_dry.wav /tmp/a.wav psola 7        # pitch moves -> clicks
-./build/vh_sweep sustained_dry.wav /tmp/b.wav psola 7     # steady pitch -> none
-```
+**How it was localised.** The entry itself named the missing experiment — "log the epoch
+series and the per-block period against click timestamps" — and it had never been run
+because the log did not exist. `tools/trace.cpp` (`vh_trace`) now writes one CSV row per
+block from `Engine::analysis()`, and `tools/click_probe.py` joins click instants against
+it and buckets them. The first run settled it:
 
-**Measurement.** First-difference outliers (>12x the local median jump). Zero in the dry
-material of both files.
-
-| material | +5 st | +7 st | +12 st |
+| melody, PSOLA | isolated clicks | at voicing edge | steady |
 |---|---|---|---|
-| melody (moving pitch), PSOLA | 14 | 11 | 14 |
-| melody, granular | 0 | 0 | 16 |
-| sustained (steady pitch), PSOLA | 0 | 0 | 0 |
+| +3 st | 14 | **14** | 0 |
+| +7 st | 15 | **15** | 0 |
+| +12 st | 12 | **12** | 0 |
 
-Clicks coincide with pitch movement: median |ΔF0| at click instants is 90–145 cents/frame
-against a 65 cents/frame overall median. PSOLA-specific at +5 and +7; both engines at +12.
+Every isolated click landed within 12 ms of a voiced/unvoiced decision flip, and `steady`
+was zero. Not "clicks are worse at edges" — clicks were **only** at edges.
 
-**Root cause.** Not diagnosed. Two candidates, untested:
-1. **Epoch tracker instability during glides.** `epoch.hpp` is a peak tracker on a lowpass
-   whose cutoff follows the fundamental at ~1.8x with 5% hysteresis. A fast glide moves the
-   cutoff; if the peak picker relocks to a different crest the phase reference jumps and
-   grains stop being coherent. **This mechanism has caused a bug here before** — RESULTS.md
-   #3, where a fixed 900 Hz cutoff let F1 through and the reference jittered.
-2. **Stale `synthSpacing` within a block.** `period` is read once per block from the shared
-   analysis frame. During a fast glide the true period changes within the block, so grains
-   placed late in it are spaced for a pitch that has moved on.
+**The four causes.**
 
-Distinguish them by logging the epoch series and the per-block period against click
-timestamps. If clicks align with epoch-interval discontinuities it is (1); if they are
-spread evenly through glides it is (2).
+1. **PSOLA switched paths with an `if`.** The grain output and the raw ring read are
+   completely different waveforms at the same instant, so every voicing edge wrote a step.
+   Now a C1 crossfade (`mix_`, 8 ms, raised cosine). The starvation backstop feeds the same
+   dial instead of overriding the output, because it was the same defect in a second place.
+2. **The voicing decision had no hysteresis.** 27 flips in 5 s on the melody, six runs
+   under 8 ms. Now an asymmetric gate: immediate to voiced, `releaseHops` (4, ~10.7 ms) to
+   unvoiced. Flips 27 -> 19, sub-8 ms runs 6 -> **0**.
+3. **F0 momentum.** A single wrong estimate moved synthesis spacing, grain size, the epoch
+   tracker's cutoff and the Mode A ratio within one hop and then moved them all back.
+   Changes under `maxStepCents` (120) are believed immediately; larger ones need
+   `jumpConfirmHops` (2, ~5.3 ms) of corroboration. Uncertainty costs latency, not
+   correctness — the design notes' own rule, applied to the tracker.
+4. **The granular fade length changed underneath a running fade.** `updateGeometry`
+   recomputed `fadeLength_` every block including mid-fade, and the gain is
+   `1 - remaining/length`. Upward the gain steps; downward the argument goes negative and,
+   the raised cosine being even, the gain turns around and the taps re-cross. The block on
+   which geometry corrected itself after a 361 Hz estimate on a 181 Hz voice carried the
+   largest step in the file: |dx| 0.084 against a block peak of 0.061. Fixed by snapshotting
+   the length at fade start, plus smoothing the geometry period (which sets delay-line
+   SHAPE, not pitch, so it need not track F0 instantly).
 
-**Ruled out.** Not the source material — the dry files contain zero click-class
-discontinuities. Not a large-shift effect — present at +5 st. Not exclusively PSOLA — the
-granular path shows it at +12 st, which suggests a shared upstream cause (the analyser or
-the epoch tracker) rather than something inside either shifter.
+**A FIX THAT WAS TRIED AND WAS WORSE, recorded so nobody retries it.** For (4), deferring
+`updateGeometry` until no fade was in flight. At ratio 2 the fade occupies half the time
+between jumps, so block boundaries keep landing inside one, the update starves for many
+blocks and then arrives all at once — a bigger step than the one being avoided. The geometry
+must keep updating; it is the FADE that must be insulated from it.
+
+**Evidence.** Full grid, two recordings x two engines x five intervals, both builds measured
+with the same detector (the "before" column is a real build of the previous commit, not a
+runtime flag):
+
+| | before | after |
+|---|---|---|
+| melody, PSOLA, +3 / +7 / +12 st | 14 / 15 / 12 | 1 / 0 / 1 |
+| melody, PSOLA, -5 / -12 st | 13 / 16 | 0 / 0 |
+| sustained, PSOLA, all intervals | 1-2 each | 1 each (the dry file's own count) |
+| **grid total** | **99** | **19** |
+
+On material never used before (see `RESULTS.md` milestone 3): flamenco cante **77 -> 1**,
+consonant-dense speech **160 -> 7** against a dry-source floor of 11.
+
+CPU cost of all four fixes together: **+5%** (16 voices, PSOLA, 128-sample block, mean
+222 -> 234 us measured against the previous build in the same container). Two of that
+overhead was self-inflicted and removed — a transcendental per sample per voice, once in the
+handover and once in the Engine envelope, both now computed only while actually moving.
+
+**Regression tests:** `tests/test_continuity.cpp`, six cases.
+
+**A note on the original measurement.** The counts in the first version of this entry were
+partly false positives. At -12 st the raw detector reported 184 clicks and 89 of them were
+the shifter's own glottal pulses — a rolling median taken across the inter-pulse silence the
+VH-001 fix correctly restored is tiny, so every pulse edge cleared it. Verified by hand:
+max|dx| over local peak of 0.02-0.21 at the flagged instants, i.e. smooth band-limited
+rises. The threshold was NOT lowered (that would have broken comparability); a step-ratio
+gate was added alongside it, with a derivation rather than a tuning. See
+`tools/click_probe.py`.
 
 ---
 
@@ -271,22 +309,55 @@ inside the note).
 ---
 
 ### VH-005 — sibilant polyphonic collapse
-**Status:** Backlog | **Severity:** S2 | **Area:** `core/include/vh/preservation.hpp`, `core/src/engine.cpp` | **Owner:** —
-**Found:** pre-existing; documented in `HANDOVER.md` §7 and `RESULTS.md`. Logged here so it
-lives in one ledger with everything else.
+**Status:** Done | **Severity:** S2 | **Area:** `core/src/engine.cpp`, `core/include/vh/voice.hpp`
 
-**Symptom.** Passing fricatives through unshifted is correct per voice, but N voices emit N
-*identical* copies which sum to one mono burst. The ensemble collapses to unison at every
-sibilant and re-diverges when voicing resumes, heard as pumping and a width artefact.
+Fixed, with a measurement that the old one could not have provided.
 
-**Measurement.** The fricative region reads 1.7x the dry energy with four voices in
-`vh_demo` output; it is audibly the worst part of `wet_psola.wav`.
+**Why the old number could not show a fix.** "The fricative region reads 1.7x the dry
+energy with four voices" is a level, and a level improves if you turn the voices down or
+delete the harmony. Same trap as duty cycle in VH-008 and "no gaps" in VH-006. The property
+the defect is about is COHERENCE, so `tools/ensemble_probe.py` measures four voices against
+ONE voice on the same material: four coherent copies give +12.0 dB, four incoherent copies
+give +6.0 dB, and where the result lands between them is the answer. A level change moves
+both renders and cancels.
 
-**Root cause.** Understood, not a mystery. `UnvoicedPolicy::PassThroughDecorrelated` is a
-named placeholder with no implementation.
+**The fix.** A fixed per-voice delay of 0.5-4 ms, spread by the golden ratio so no two are a
+simple multiple (equal spacing would put every voice's comb notches on the same frequencies
+and colour the ensemble instead of diffusing it), applied to the WHOLE voice in
+`Engine::process` after the blend. Broadband noise decorrelates within ~0.1 ms, so identical
+copies stop summing coherently. `Humanization::staticDelayMs` — the first row of that struct
+the Engine reads.
 
-**Candidate fix.** Per-voice allpass, per-voice micro-delay, or mild per-voice spectral
-warp on unvoiced frames. Real backing singers sibilate decorrelated. Untried.
+**Why after the blend and not inside a shifter:** the fast and quality engines would
+otherwise get different offsets and comb against each other.
+
+**Why a delay and not the allpass this entry proposed.** An allpass is flat in magnitude but
+disperses the glottal pulse on VOICED frames too, so it would have to be switched in and out
+with voicing — and a switched filter is exactly the class of defect VH-002 was. A static
+delay needs no switching, so it cannot introduce one. It is also the physical situation being
+modelled: four singers at four distances from one microphone.
+
+**Evidence.** `collapse` is 0 for an ensemble, 1 for four copies of one voice.
+
+| material | before | after |
+|---|---|---|
+| synthetic demo phrase (the 1.7x figure's own material) | 0.79 | **0.41** |
+| flamenco cante | 0.82 | **0.13** |
+| consonant-dense speech | 0.66 | **0.03** |
+
+**The honest caveat.** The voiced control window moves too, by less (flamenco +10.21 ->
++7.62 dB against the fricative's +10.98 -> +6.82). The delay is applied to the whole voice by
+design, so it decorrelates everything a little and fricatives a lot. That is a consequence,
+not a side effect, and it is stated because a reader comparing only the headline number would
+conclude the change is fricative-specific and it is not.
+
+`UnvoicedPolicy::PassThroughDecorrelated` is now the DEFAULT; `PassThrough` is retained and
+reproduces the previous behaviour exactly, which is what makes the table above an A/B rather
+than an assertion.
+
+**Regression test:** `tests/test_continuity.cpp`, "N voices do not sum coherently on unvoiced
+material" — which also asserts that the control still reproduces the defect, so it cannot
+pass by the decorrelation having been quietly disabled.
 
 ---
 
@@ -400,10 +471,63 @@ documents later. `VOICE-MODEL.md` C1 is marked unverified; this entry is why.
 
 ---
 
+### VH-011 — granular still shows crossfade seams at large upward shifts
+**Status:** Backlog | **Severity:** S3 | **Area:** `core/src/granular_shifter.cpp` | **Owner:** —
+**Found:** the residual of the VH-002 grid. Logged rather than left as an unexplained number.
+
+**Symptom.** After VH-002, the grid is clean everywhere except `melody/granular/+12`, which
+still scores 7 isolated clicks against 0-1 elsewhere. Upward-shift specific, worst on moving
+pitch, absent on the sustained recording.
+
+**Measurement.**
+
+| | before VH-002 | after |
+|---|---|---|
+| melody, granular, +12 st | 10 | **7** |
+| melody, granular, all other intervals | 0-2 | 0-1 |
+| sustained, granular, all intervals | 1 | 0-1 |
+
+Instrumented directly (a throwaway harness driving `GranularShifter` and logging every
+jump): the largest step in the file fell from |dx| 0.084 to 0.032 against a block peak of
+0.055 once the fade-length snapshot landed. What remains are events of ratio 0.35-0.6, i.e.
+right at the detector's threshold, distributed through the glide.
+
+**Root cause. Probably not a defect, and that is why this is S3.** At ratio 2 the read
+pointer closes on the write head at one sample per sample, so with `jumpPeriods = 1` a jump
+is needed roughly every period — about every 130 samples on this material — and each jump is
+a crossfade seam between two taps reading different parts of the waveform. Seven audible
+seams in five seconds is what "the fast path never sounds transparent" means in numbers. The
+header of `granular_shifter.hpp` has always said this is the trade that buys the latency.
+
+**Ruled out.**
+- Not the fade-length mutation (VH-002 cause 4). That is fixed and measured; these events
+  survive it.
+- Not the geometry period. Smoothing it removed three of the ten and no more.
+- Not F0 error on its own — the estimate is stable through several of the remaining events.
+- Not the voicing edge: `at_voicing_edge` is 0 for all seven.
+
+**Candidate fix, with its trade-off.** Scale `jumpPeriods` with the shift ratio, so a large
+upward shift jumps further and less often. Fewer seams, but the delay must accommodate the
+jump, so `baseDelay_` and therefore the fast path's latency grow with the interval — which
+is the one thing this engine exists to keep small. Whether that trade is worth it is a
+listening question, and it should be asked only if anyone actually hears these.
+
+**Do not fix this by lengthening the crossfade.** A longer fade smears more of the waveform
+into each seam; it moves the artefact from click-like to chorus-like rather than removing it.
+
+---
+
 # Done
 
 *VH-003 and VH-008 landed with measurements and a listening test in `RESULTS.md`
-milestone 2; their stubs are above. VH-001, VH-006 and VH-009 are fixed and in review — they move here once someone has
+milestone 2; their stubs are above. VH-002 and VH-005 landed in milestone 3 with
+measurements on four recordings and six regression tests; their stubs are above too.
+VH-001, VH-006 and VH-009 are fixed and in review — they move here once someone has
 listened to the regenerated sweeps and confirmed the reintroduced inter-pulse gaps are
 acceptable. Bugs fixed before this ledger existed are written up in `RESULTS.md` — seven of
 them, each with a symptom that pointed away from its cause.*
+
+*Still open and unchanged by milestone 3: VH-004 (broadband hash at small downward shifts
+on low fundamentals), VH-007 (the docs' "+/- 6 semitones" claim), VH-010 (no metric isolates
+ring truncation) and VH-011 above. None of them is a continuity defect; VH-002's fixes do
+not touch them and were not expected to.*

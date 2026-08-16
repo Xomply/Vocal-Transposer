@@ -294,12 +294,12 @@ earlier grains' tails. The tests caught it immediately. Zero grains is healthy o
 
 Ranked by value per unit effort.
 
-**0. Listen to the milestone 2 sweep and close VH-008.** Both corrections that landed are
-timbre changes, and no metric in the harness can tell "less buzzy" from "darker". Generate
-with `python3 tools/make_probe_tones.py probe/ && python3 tools/model_sweep.py
-./build/vh_sweep sweepout/ probe/*.wav`, then A/B `probe_242hz__-24st__hold.wav` against
-`__mu.wav` and `__mu+tilt.wav`. Nothing else on this list is blocked on it, but VH-008 and
-VH-009 cannot move to Done without it.
+**0. Done — VH-008 closed by listening.** `mu+tilt` A/B'd against the pre-profile engine
+on both real recordings, -24 st through +19 st: unambiguous improvement at every interval,
+most audible at -24 and -12 st. See `RESULTS.md` milestone 2. **Still open:** VH-010, how
+much of it is the open-quotient correction versus mu incidentally lengthening the grain —
+and the comparison was only against the pre-profile engine, not against a source-filter
+engine or the blend-tilt fallback.
 
 **1. Record your own voice and run `vh_render`.** No code required. Your microphone, your
 room, your consonants, your register are all untested; the two validation recordings are

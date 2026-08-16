@@ -17,10 +17,13 @@ Then:
 
 ## Status
 
-**Milestone 2 reached — the voice model is in the engine.** `mu = ratio^0.3` gives
-independent formant control from inside PSOLA, measured at -24 st to raise duty by exactly
-the predicted 1/mu with zero cents of pitch movement. VH-003's 17 dB upward level loss is
-fixed. Measurements in `RESULTS.md`; 41 tests; 18% of a 64-sample budget at 16 voices.
+**Milestone 2 reached — the voice model is in the engine, confirmed by listening.**
+`mu = ratio^0.3` gives independent formant control from inside PSOLA, measured at -24 st to
+raise duty by exactly the predicted 1/mu with zero cents of pitch movement. VH-003's 17 dB
+upward level loss is fixed. On real recordings, A/B'd -24 st through +19 st, the full
+profile is an unambiguous improvement over the pre-profile engine at every interval.
+Measurements and the listening test in `RESULTS.md`; 41 tests; 18% of a 64-sample budget at
+16 voices.
 
 Milestone 1 (the principles work) is also in `RESULTS.md`.
 

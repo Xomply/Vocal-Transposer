@@ -370,9 +370,13 @@ the intended behaviour and not an oversight.
 3. **Is `k_mu = 0.3` right by ear?** It is derived from two population datapoints, which
    is two more than 0.8 had, but it is still a fit to a smooth law over data that has
    register breaks in it. Sweep k and listen.
-4. **How much of the VH-008 buzz is open quotient versus truncated ring?** (§5.) Decides
-   whether the tilt filter is a large win or a small one, and it is testable by applying
-   the tilt correction alone and re-measuring.
+4. **How much of the VH-008 buzz is open quotient versus truncated ring?** (§5.) A
+   listening test on real recordings confirmed `mu+tilt` is a large, unambiguous
+   improvement over the pre-profile engine at every interval from -24 to +19 st — see
+   `RESULTS.md` milestone 2. That answers "does the correction work", not this question:
+   nothing so far separates the two mechanisms' contributions, because VH-010 (below) is
+   still open. The question survives the listening test; only "is it worth building"
+   is answered.
 5. **Should reading 2 exist as a toggle?** (§1.) A physically consistent lower singer is a
    different and also musically valid instrument. It would need register compensation,
    which is the work reading 3 avoids.

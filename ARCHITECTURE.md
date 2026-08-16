@@ -60,6 +60,7 @@ core/include/vh/
   epoch.hpp          Glottal phase reference. Consistency, not anatomical truth.
   yin.hpp            F0 estimation, two-stage. The F0-hold policy lives here.
   preservation.hpp   "Same voice" as seven independent decisions.
+  voicing.hpp        Those decisions as CURVES of the shift ratio, not constants.
   shifter.hpp        IPitchShifter + ReadCursor. Freeze lives in the cursor.
   granular_shifter.hpp  FAST path. Resamples; pitch-synchronous jumps kill the comb.
   psola_shifter.hpp     QUALITY path. Formants preserved by construction.
@@ -150,9 +151,11 @@ host to check a windowing change.
 
 ## The better version we couldn't reach
 
-- **No source-filter engine.** PSOLA degrades past roughly +/- 6 semitones — that is where
-  the technique ends, not a tuning problem. Octave-range shifting and any real timbre
-  control need WORLD or an LPC path. This is the single biggest remaining gap, and
+- **No source-filter engine.** Timbre control landed without it (see below), so the
+  remaining case is narrower and sharper: it is the only way to generate tract ring beyond
+  one source period, and the only way to move formants WITHOUT stretching the glottal pulse
+  inside the grain, because resampling scales the whole grain and cannot separate source
+  from filter. This is the single biggest remaining gap, and
   `latency-budget.md` argues WORLD may also be FASTER than a phase vocoder at steady state.
 - **Epoch detection is a peak tracker, not a GCI detector.** It gives a CONSISTENT phase
   reference, which is what PSOLA actually needs, but it is not DYPSA or SEDREAMS and it has
@@ -162,10 +165,12 @@ host to check a windowing change.
   per-voice detune, vibrato and pan; the Engine does not yet read it. Until it does,
   N voices are N *identical* shifted copies, which sums toward one flanged voice rather
   than a choir. This is the cheapest large improvement available.
-- **`envelopeWarp` is unused.** `PreservationSpec` carries the mu ~ 0.8 vocal-tract warp
-  that makes an octave-down read as a bass rather than as slowed tape, and nothing applies
-  it, because neither current engine can move the envelope independently of pitch. It waits
-  on the source-filter engine.
+- **`envelopeWarp` is unused** — resolved in milestone 2, and the fix was smaller than the
+  wait implied. `VoicingProfile` replaces the constant with `mu = ratio^0.3` (derived from
+  population data, and reproducing the literature's 0.8 at an octave), and `PsolaShifter`
+  applies it by resampling grain CONTENT. PSOLA sets pitch by WHEN grains are emitted, so
+  the content was always free; nobody had used it. No FFT, no source-filter engine, no new
+  dependency. See `VOICE-MODEL.md` §5.
 - **Onsets are the weak spot**, as predicted. A voice entering mid-vowel starts from an
   8 ms linear ramp; there is no attack shaping and no ducking on high analysis residual.
 - **YIN's refinement stage recomputes the difference function** in a narrow band rather

@@ -150,7 +150,31 @@ catch it.
 ---
 
 ### VH-008 — large downward shifts are a PULSE TRAIN, not a lower voice ("square wave")
-**Status:** Backlog | **Severity:** S2 | **Area:** `core/src/psola_shifter.cpp` | **Owner:** —
+**Status:** In review | **Severity:** S2 | **Area:** `core/src/psola_shifter.cpp` | **Owner:** —
+
+**PARTIALLY ADDRESSED, AWAITING LISTENING TESTS. The diagnosis below was half right and the
+half it got wrong is the more actionable half.**
+
+`duty = 2 * ratio` is correct, and it is measuring the **open quotient collapsing**, not a
+gap needing filling. A PSOLA grain is copied verbatim, so the EXCITATION keeps its absolute
+duration while the output period grows by `1/ratio`. At -24 st a soprano's ~0.6 ms open
+phase sits inside a 20 ms period: open quotient ~0.03. That is an impulse train, and an
+impulse train has energy at every multiple of its rate — which is the dense harmonic comb
+this entry reports. **The buzz has two causes, not one:** the collapsed open quotient (a
+SOURCE problem) and the truncated tract ring (option 1 below).
+
+Two corrections landed, both in milestone 2:
+
+- **mu warp.** Resampling grain content by `mu = ratio^0.3` stretches the grain by `1/mu`,
+  so `duty = 2 * ratio / mu`. Measured at -24 st on a 242 Hz probe: duty 0.31 -> 0.47, a
+  factor of 1.52 against a predicted 1/mu of 1.52, **with zero cents of pitch movement**.
+- **Source tilt shelf.** A first-order approximation of holding the open quotient constant.
+
+**Before this can move to Done:** listen. Both corrections are timbre changes and no metric
+in the harness can tell "less buzzy" from "darker". `sweepout/wav/probe_242hz__-24st__*`
+is the A/B. Set `tiltStrength = 0` to hear the two corrections separately.
+
+**Still open:** ring truncation. See VH-010 for why it could not be measured.
 **Found:** by ear, listening to the regenerated VH-001 sweeps: the pitch is right but it
 "sounds like a square wave — the grain does not fill the period". Characterised with
 `tools/inspect_audio.py`, which was written for this.
@@ -197,7 +221,8 @@ give no gaps at the wrong pitch. **There is no grain width that gives both.** Th
 real reason TD-PSOLA is described as limited to modest downward shifts — a sharper statement
 than the "±6 semitones" of VH-007, and in the opposite direction.
 
-**Options, in order of honesty.**
+**Options, in order of honesty.** *(1 and 3 stand; 2 is now less urgent because mu raises
+duty without giving up formant preservation, which is what option 2 was buying.)*
 1. **Source-filter engine (WORLD or LPC) — the actual answer.** The gap exists because a
    copied grain has no way to ring. A vocal-tract filter excited at the new rate rings
    naturally and fills the gap with the right spectrum. This is already the top roadmap
@@ -265,41 +290,13 @@ the epoch tracker) rather than something inside either shifter.
 ---
 
 ### VH-003 — PSOLA loses up to 17 dB of level on large upward shifts
-**Status:** Backlog | **Severity:** S2 | **Area:** `core/src/psola_shifter.cpp` | **Owner:** —
-**Found:** measurement sweep, `tools/sweep_range.py`.
+**Status:** Done | **Severity:** S2 | **Area:** `core/src/psola_shifter.cpp`
 
-**Symptom.** Output level falls steadily with upward shift while periodicity stays
-constant. Heard as thinness and hollowness rather than as noise or glitching, which is why
-`vh_bench`'s cents table reports the same shifts as healthy.
-
-**Repro.** `python3 tools/sweep_range.py ./build/vh_render ./build/vh_sweep sustained_dry.wav ./sweep`
-
-**Measurement.** Level relative to the same engine at 0 st, soprano (814 Hz):
-
-| shift | PSOLA | granular (control, same ratio) |
-|---|---|---|
-| +4 st | −3.3 dB | −0.0 dB |
-| +7 st | −6.1 dB | −0.1 dB |
-| +18 st | −14.3 dB | −2.0 dB |
-| +21 st | −17.3 dB | −1.9 dB |
-
-**Root cause.** Not diagnosed. Constant periodicity with falling level means grains are
-summing **incompletely** — partial cancellation — rather than degrading into noise. The
-first place to look is the gain normalisation `synthSpacing / halfLen`: on an upward shift
-`halfLen` is pinned to `period` while `synthSpacing` shrinks, so the compensation falls
-linearly with the ratio. Whether that is correct depends on how far the Hann windows
-actually overlap at that spacing, which is worth deriving rather than assuming.
-
-**Ruled out.** Not clipping (peaks fall, they do not saturate). Not the analyser (granular
-shares it and holds level). Not a listening-file artefact — measured on raw `vh_sweep`
-output with no gain trim.
-
-**Related, and NOT fixed by VH-001.** The VH-001 fix clamped the same gain expression to
-`min(synthSpacing / halfLen, 1.0)`, but that clamp only binds on DOWNWARD shifts — upward,
-`synthSpacing < halfLen` so the ratio is already below 1.0 and the clamp is inert. Upward
-output after the fix is unchanged and the level loss above is still present. A proper
-derivation of the Hann overlap-add sum, rather than the current `S/H` approximation plus a
-clamp, is the likely fix for both directions at once and has not been attempted.
+Fixed. The overlap-add gain `min(S/H, 1.0)` came from a window-envelope argument; PSOLA is
+not an envelope problem. What must be preserved is the glottal PULSE amplitude, and the
+pulse sits at the window peak, so the correct gain is **1.0**. The clamp meant downward
+already got 1.0, which is why the bug looked upward-only. Measurements and the residual
+tail-cancellation component in `RESULTS.md`, milestone 2.
 
 ---
 
@@ -400,13 +397,81 @@ and is probably right *about TD-PSOLA in general*. Rewriting the docs before VH-
 VH-003 are fixed would record the limits of a buggy implementation as the limits of the
 method. Re-measure after those land, then rewrite.
 
-**Blocked by.** VH-001, VH-003.
+**Blocked by.** VH-001, VH-003. **VH-003 is now Done**, so this is unblocked. Milestone 2
+measured the real limits and they are in `RESULTS.md`; what is still missing before the
+docs can be rewritten is a listening pass, because two of the three limits (open quotient,
+truncated ring) are timbre and not level.
+
+**Partly answered already.** `VOICE-MODEL.md` restates the limit as three separate
+mechanisms rather than one number — tail cancellation upward, open-quotient collapse
+downward, ring truncation downward — and `psola_shifter.hpp`'s header comment has been
+rewritten to say so. What remains is propagating that into `HANDOVER.md` and
+`ARCHITECTURE.md` once the listening pass confirms it.
+
+---
+
+### VH-009 — upward shifts run hot enough to clip
+**Status:** In review | **Severity:** S1 | **Area:** `core/src/psola_shifter.cpp`, `tools/wav.hpp` | **Owner:** —
+**Found:** milestone 2 sweep. Three of 108 cells wrote files at full scale.
+
+**Symptom.** Upward shifts at large intervals reach 0 dBFS. Heard as harsh, brittle
+distortion on the loudest partials rather than as a level problem, which is why it would be
+blamed on the shifter's timbre.
+
+**Fixed, in two places.** The tilt shelf no longer boosts (see `RESULTS.md`), and
+`writeWav` scales rather than hard-clamping, announcing the scalar. No cell in the sweep
+clips now and the scaler never fires.
+
+**NOT fixed, and not a defect.** PSOLA upward genuinely produces more energy: +6.4 dB at
++19 st on the 814 Hz probe with the profile DISABLED, so it is purely the VH-003 gain
+correction, and it is physically correct — more glottal pulses per second is more energy
+per second. `core` has no output stage by design.
+
+**Where the remaining headroom belongs.** The mixer. `vh_render` already applies
+`1/sqrt(n)` and an 0.9 trim; `vh_sweep` deliberately applies neither, because it is a
+measurement tool. **The JUCE shell must apply headroom, and this entry exists so that work
+inherits the requirement rather than rediscovering it at a soundcheck.**
+
+**Ruled out.** Not the mu warp — cells with `muStrength = 0` clip too. Not the blend — a
+single voice clips on its own.
+
+---
+
+### VH-010 — the C1 source-pitch prediction cannot be measured with the current metrics
+**Status:** Backlog | **Severity:** S3 | **Area:** `tools/voice_probe.py` | **Owner:** —
+**Found:** milestone 2, trying to test `VOICE-MODEL.md` C1.
+
+**The prediction.** Downward quality is bound by SOURCE pitch, not by shift ratio, because
+a grain carries only `2/F0_source` seconds of vocal tract ring against a tract that rings
+for 5-15 ms. A soprano should fall apart where a bass is clean.
+
+**Symptom.** No metric separates it. `tools/make_probe_tones.py` was written specifically
+for this — 90, 242 and 814 Hz, identical in every other respect — and at -24 st the three
+give duty 0.44 / 0.31 / 0.35 with cents error +2410 / -4 / +0, where the 90 Hz outlier is
+the ESTIMATOR's floor (22 Hz output) and not the engine.
+
+**Ruled out.** Not that the effect is absent — nothing here measures ring truncation.
+- *duty* measures excitation shape, i.e. the open quotient, which is a different mechanism.
+- *envelope distance* measures whether the envelope MOVED, which mu does deliberately.
+- *envelope contrast* was added specifically to catch formant smearing and is confounded:
+  it RISES with downward shift on all three sources, because a denser harmonic comb adds
+  ripple to the liftered envelope and swamps the effect.
+
+**Candidate fix.** A metric that isolates the decay envelope WITHIN one output period —
+fit an exponential to the Hilbert envelope between excitation instants and compare its time
+constant against the dry material's. A truncated ring should show a shorter time constant
+that does not scale with the output period.
+
+**Why this is logged rather than dropped.** A plausible prediction with no supporting
+measurement is exactly the shape of the thing that gets cited as established fact three
+documents later. `VOICE-MODEL.md` C1 is marked unverified; this entry is why.
 
 ---
 
 # Done
 
-*Nothing yet. VH-001 and VH-006 are fixed and in review — they move here once someone has
+*VH-003 landed with measurements in `RESULTS.md` milestone 2; its stub is above. VH-001,
+VH-006, VH-008 and VH-009 are fixed and in review — they move here once someone has
 listened to the regenerated sweeps and confirmed the reintroduced inter-pulse gaps are
 acceptable. Bugs fixed before this ledger existed are written up in `RESULTS.md` — seven of
 them, each with a symptom that pointed away from its cause.*

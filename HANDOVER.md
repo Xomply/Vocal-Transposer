@@ -1,7 +1,8 @@
 # HANDOVER
 
-*Read this first. `ARCHITECTURE.md` has the module-by-module reasoning; `RESULTS.md` has
-the measurements and the bug log. This document tells you what the thing is, what it
+*Read this first. `VOICE-MODEL.md` says what a voice is and therefore what the DSP must get
+right; `ARCHITECTURE.md` has the module-by-module reasoning; `RESULTS.md` has the
+measurements; `BUGS.md` is the ledger of open defects. This document tells you what the thing is, what it
 deliberately is not, and how to work on it.*
 
 ---
@@ -93,14 +94,21 @@ fighting it.
 
 ### Not present, and you will probably want it
 
-**No source-filter engine (WORLD, LPC, STRAIGHT).** This is the single biggest gap.
-Consequences:
-- **PSOLA ends around ±6 semitones.** That is where the technique ends, not a tuning
-  problem. Octave-range harmony will sound rough.
-- **No timbre control.** `PreservationSpec::envelopeWarp` exists, carries the μ≈0.8
-  vocal-tract warp that makes an octave-down read as a bass rather than as slowed tape, and
-  **nothing applies it**, because neither current engine can move the spectral envelope
-  independently of pitch.
+**No source-filter engine (WORLD, LPC, STRAIGHT).** Still the biggest gap, but it is a
+SMALLER gap than this document used to claim, and the reasons matter.
+
+- **"PSOLA ends around ±6 semitones" is not what this code does.** See `BUGS.md` VH-007.
+  Three separate mechanisms bound the range, in different directions: tail cancellation
+  upward, open-quotient collapse downward, and tract-ring truncation downward. One number
+  concealed all three.
+- **Timbre control now EXISTS.** `PreservationSpec::voicing` carries mu as a curve of the
+  shift ratio, and `PsolaShifter` applies it by resampling grain content — independent
+  formant control, in the time domain, with no FFT. `envelopeWarp` is superseded and kept
+  only as the A/B control. See `VOICE-MODEL.md` §5.
+- **What a source-filter engine is still needed for** is narrower and sharper than "quality":
+  it is the only way to generate tract ring beyond one source period, and the only way to
+  move formants WITHOUT also stretching the glottal pulse inside the grain. Resampling
+  cannot separate source from filter. That coupling is the argument.
 - Note `latency-budget.md` argues WORLD may be *faster* than a phase vocoder at steady
   state, because its F0 cost is a convergence cost while the vocoder's window is paid every
   frame. If that holds, WORLD wins on both axes.
@@ -286,6 +294,13 @@ earlier grains' tails. The tests caught it immediately. Zero grains is healthy o
 
 Ranked by value per unit effort.
 
+**0. Listen to the milestone 2 sweep and close VH-008.** Both corrections that landed are
+timbre changes, and no metric in the harness can tell "less buzzy" from "darker". Generate
+with `python3 tools/make_probe_tones.py probe/ && python3 tools/model_sweep.py
+./build/vh_sweep sweepout/ probe/*.wav`, then A/B `probe_242hz__-24st__hold.wav` against
+`__mu.wav` and `__mu+tilt.wav`. Nothing else on this list is blocked on it, but VH-008 and
+VH-009 cannot move to Done without it.
+
 **1. Record your own voice and run `vh_render`.** No code required. Your microphone, your
 room, your consonants, your register are all untested; the two validation recordings are
 studio material at comfortable levels. This will find things.
@@ -300,9 +315,11 @@ out, 64–128 sample buffers. Then run LatencyMon on the target machine — the 
 characterise. Keep the shell thin: pump MIDI into `Engine`, call `Engine::process`, nothing
 else.
 
-**4. Source-filter engine (WORLD or LPC).** Unlocks octaves, the μ≈0.8 envelope warp, and
-real timbre control. Note WORLD's reference implementation is offline-batch; making the
-analysis causal and streaming is the actual work.
+**4. Source-filter engine (WORLD or LPC).** No longer needed for the envelope warp — that
+landed in milestone 2. Needed for the two things resampling cannot do: generate tract ring
+beyond one source period, and move formants without stretching the glottal pulse with them.
+WORLD's reference implementation is offline-batch; making the analysis causal and streaming
+is the actual work.
 
 **5. Decorrelated unvoiced path.** Measured and unsolved: N voices passing the *same*
 fricative through unshifted sum to one mono burst, collapsing the ensemble at every
@@ -331,7 +348,9 @@ continuous C¹ crossfade; equal-gain (not equal-power) blend normalisation; hold
 through unvoiced frames; one shifter instance per voice; Modes A and B being different
 instruments.
 
-**Provisional** — meant to move: `kMaxVoices = 16`; 2 s input history; YIN's 70 Hz floor
+**Provisional** — meant to move: the voicing profile's exponents (`kMu = 0.30` is derived
+from two population datapoints and is the only one with data behind it; `kTilt = 1.0`
+follows from open quotient being scale-free and is untested by ear); `kMaxVoices = 16`; 2 s input history; YIN's 70 Hz floor
 and 0.15 threshold; 128-sample analysis hop; 200 ms max F0 hold; `envelopeWarp = 0.8`;
 `RegisterSplitPolicy` crossover at 220 Hz (a pure guess); `OnsetHandoverPolicy` 25→70 ms
 (the parameters most worth tuning by ear first); oldest-first voice stealing; the 4×

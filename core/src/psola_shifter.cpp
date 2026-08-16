@@ -46,9 +46,11 @@ void PsolaShifter::reset() noexcept {
     started_ = false;
     lastGrainPos_ = 0;
     haveGrain_ = false;
-    tiltLp_ = 0.0;
+    tiltLpT_ = 0.0;
+    tiltLpS_ = 0.0;
     tiltG_ = 1.0;
-    tiltK_ = 0.0;
+    tiltKT_ = 0.0;
+    tiltKS_ = 0.0;
     tiltPrimed_ = false;
 }
 
@@ -124,45 +126,95 @@ void PsolaShifter::placeGrain(const AudioRing& ring, Pos centre, Pos sourceEpoch
 // THE ONE-LINE VERSION: a copied grain keeps its excitation's ABSOLUTE duration while the
 // output period grows by 1/ratio, so the open quotient collapses by ratio and the source
 // becomes an impulse train. A real voice holds its open quotient roughly constant across
-// pitch, so its excitation's spectral corner scales WITH the target F0. The difference
-// between those two is a first-order shelf: darker going down, brighter going up.
+// pitch, so its excitation's spectral corner scales WITH the target F0.
+//
+// SO THE CORRECTION IS A SHELF BETWEEN TWO CORNERS, not a single-corner one.
+//
+//   below f_tgt              unchanged        (both voices are flat here)
+//   f_tgt .. f_src           rolling off      (the target's corner has passed, the
+//                                              source's has not)
+//   above f_src              flat at ratio^k  (both have rolled off; the difference is
+//                                              the constant shelf)
+//
+// where f_src = F0_src / OQ and f_tgt = F0_tgt / OQ = f_src * ratio.
+//
+// I BUILT THE SINGLE-CORNER VERSION FIRST AND IT WAS WRONG, in a way that measured as a
+// level bug rather than a tone bug: with one pole at f_tgt the whole band above f_tgt got
+// the full shelf. Two corners confine the change to the band where the two voices actually
+// differ, which is the band between their excitation corners.
+//
+// NORMALISATION: THE SHELF IS A PURE CUT AND MAY NEVER BOOST. Written with DC gain 1 and
+// HF gain g it is a cut going down (g < 1) and a BOOST going up (g > 1), and the boost
+// clipped: peak 1.00 at +12 and +19 st, measured. See BUGS.md VH-009.
+//
+// A tilt only claims a RELATIVE spectral shape; where the 0 dB reference sits is a free
+// choice, and loudness is a mix decision that belongs to the voice gain and not to a
+// source model. So the reference is put at whichever end would otherwise exceed unity:
+//
+//   y = (1 / max(1, g)) * [ lp(x, f_tgt) + g * (x - lp(x, f_src)) ]
+//
+//   g < 1 (downward)   LF gain 1,    HF gain g     -- darker, level falls
+//   g > 1 (upward)     LF gain 1/g,  HF gain 1     -- brighter, level falls
+//
+// The shape being modelled is IDENTICAL either way. What changes is that this filter can
+// now only ever reduce peak level, so it cannot be the thing that clips.
+//
+// I TRIED 1/sqrt(g) FIRST, which centres the tilt about the geometric mean of the two
+// corners and is arguably the more honest picture of a real voice -- a bass's glottal pulse
+// is longer AND larger, so a real model boosts lows as much as it cuts highs. It also put
+// three cells of the sweep at full scale. A clipped sample is destroyed audio; a quiet one
+// is a fader move. Recorded because the rejected version is the more physical one and
+// somebody will propose it again.
 //
 // WHAT THIS IS NOT: a source model. It is the first-order spectral consequence of one,
-// applied to the output, chosen because it costs a one-pole filter and no new machinery.
-// The exact answer needs an LPC residual/filter split. Set tiltStrength = 0 to measure
-// how much of the VH-008 buzz this accounts for versus the truncated ring.
+// applied to the output, chosen because it costs two one-poles and no new machinery. The
+// exact answer needs an LPC residual/filter split. Set tiltStrength = 0 to measure how
+// much of the VH-008 buzz this accounts for versus the truncated ring.
 //
 // WHY THE COEFFICIENTS ARE INTERPOLATED ACROSS THE BLOCK: in Mode A the ratio moves with
-// the sung pitch, so both the corner and the shelf gain move every block. Stepping a
-// filter coefficient at a block boundary is a discontinuity in the output — the same
-// class of defect as a crossfade with a kink, and it clicks for the same reason.
+// the sung pitch, so corners and shelf gain move every block. Stepping a filter
+// coefficient at a block boundary is a discontinuity in the output — the same class of
+// defect as a crossfade with a kink, and it clicks for the same reason.
 void PsolaShifter::applySourceTilt(const ShiftRequest& req, const AnalysisFrame& a,
                                    double ratio, FrameCount n) noexcept {
     const VoicingProfile& vp = req.preservation->voicing;
 
     const double gTarget = vp.tiltGainFor(ratio);
-    const double cornerHz = vp.tiltCornerHz(static_cast<double>(a.f0Hz), ratio);
+    const double cornerTgt = vp.tiltCornerHz(static_cast<double>(a.f0Hz), ratio);
+    const double cornerSrc = vp.tiltCornerHz(static_cast<double>(a.f0Hz), 1.0);
 
     // No F0 anchor means no open quotient to correct. Bypass rather than guess.
-    if (cornerHz <= 1.0 || std::abs(gTarget - 1.0) < 1e-6) { tiltPrimed_ = false; return; }
+    if (cornerTgt <= 1.0 || cornerSrc <= 1.0 || std::abs(gTarget - 1.0) < 1e-6) {
+        tiltPrimed_ = false;
+        return;
+    }
 
-    const double fc = std::clamp(cornerHz, 20.0, 0.45 * sampleRate_);
-    const double kTarget = 1.0 - std::exp(-2.0 * M_PI * fc / sampleRate_);
+    const double nyq = 0.45 * sampleRate_;
+    const double fT = std::clamp(cornerTgt, 20.0, nyq);
+    const double fS = std::clamp(cornerSrc, 20.0, nyq);
+    const double kT = 1.0 - std::exp(-2.0 * M_PI * fT / sampleRate_);
+    const double kS = 1.0 - std::exp(-2.0 * M_PI * fS / sampleRate_);
 
-    if (!tiltPrimed_) { tiltG_ = gTarget; tiltK_ = kTarget; tiltPrimed_ = true; }
+    if (!tiltPrimed_) { tiltG_ = gTarget; tiltKT_ = kT; tiltKS_ = kS; tiltPrimed_ = true; }
 
-    const double dG = (gTarget - tiltG_) / static_cast<double>(n > 0 ? n : 1);
-    const double dK = (kTarget - tiltK_) / static_cast<double>(n > 0 ? n : 1);
+    const double inv = 1.0 / static_cast<double>(n > 0 ? n : 1);
+    const double dG = (gTarget - tiltG_) * inv;
+    const double dT = (kT - tiltKT_) * inv;
+    const double dS = (kS - tiltKS_) * inv;
 
     for (FrameCount i = 0; i < n; ++i) {
         tiltG_ += dG;
-        tiltK_ += dK;
+        tiltKT_ += dT;
+        tiltKS_ += dS;
         const double x = static_cast<double>(req.out[i]);
-        tiltLp_ += tiltK_ * (x - tiltLp_);
-        req.out[i] = static_cast<Sample>(tiltLp_ + tiltG_ * (x - tiltLp_));
+        tiltLpT_ += tiltKT_ * (x - tiltLpT_);
+        tiltLpS_ += tiltKS_ * (x - tiltLpS_);
+        const double pivot = 1.0 / (tiltG_ > 1.0 ? tiltG_ : 1.0);
+        req.out[i] = static_cast<Sample>(pivot * (tiltLpT_ + tiltG_ * (x - tiltLpS_)));
     }
     tiltG_ = gTarget;
-    tiltK_ = kTarget;
+    tiltKT_ = kT;
+    tiltKS_ = kS;
 }
 
 void PsolaShifter::process(const ShiftRequest& req) noexcept {

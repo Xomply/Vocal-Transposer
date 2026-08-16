@@ -8,6 +8,7 @@
 
 #include "vh/types.hpp"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -80,9 +81,30 @@ inline bool writeWav(const std::string& path, const std::vector<vh::Sample>& in,
     h.dataSize = static_cast<uint32_t>(in.size() * 2);
     h.riffSize = 36 + h.dataSize;
     std::fwrite(&h, sizeof(h), 1, f);
+    // NEVER CLIP SILENTLY. This used to hard-clamp to +/-1, which destroys samples and --
+    // worse for this repo -- destroys them INSIDE a measurement, so the sweep that found
+    // VH-009 was itself reporting distorted audio as data.
+    //
+    // Scaling instead is safe here because every consumer of these files is either a
+    // listening comparison (where one known scalar per file is fine) or voice_probe.py
+    // (which reports level RELATIVE to dry, so a scalar shows up as a number rather than
+    // as harmonic distortion that looks like an engine defect).
+    //
+    // The scalar is announced on stderr rather than hidden, because a file that is 3 dB
+    // down for an unstated reason is exactly the kind of thing that gets diffed later and
+    // blamed on the wrong commit.
+    float peak = 0.0f;
+    for (float s : in) { const float a = s < 0.0f ? -s : s; if (a > peak) peak = a; }
+    float scale = 1.0f;
+    if (peak > 1.0f) {
+        scale = 0.999f / peak;
+        std::fprintf(stderr, "wav: %s peaked at %.3f, scaled by %.3f (%.1f dB) to avoid clipping\n",
+                     path.c_str(), static_cast<double>(peak), static_cast<double>(scale),
+                     20.0 * std::log10(static_cast<double>(scale)));
+    }
     std::vector<int16_t> raw(in.size());
     for (size_t i = 0; i < in.size(); ++i) {
-        float s = in[i];
+        float s = in[i] * scale;
         s = s > 1.0f ? 1.0f : (s < -1.0f ? -1.0f : s);
         raw[i] = static_cast<int16_t>(s * 32767.0f);
     }

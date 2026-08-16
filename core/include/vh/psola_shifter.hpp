@@ -111,9 +111,11 @@ private:
     // backstop, no F0) so that re-entry snaps the coefficients to their target instead of
     // slewing from stale values that relate to audio from before the gap. Same reasoning
     // as Engine's shifter re-entry reset.
-    double tiltLp_ = 0.0;
+    double tiltLpT_ = 0.0;   // one-pole at the TARGET voice's excitation corner
+    double tiltLpS_ = 0.0;   // one-pole at the SOURCE voice's excitation corner
     double tiltG_ = 1.0;
-    double tiltK_ = 0.0;
+    double tiltKT_ = 0.0;
+    double tiltKS_ = 0.0;
     bool tiltPrimed_ = false;
 
     // Hann window, precomputed at unit length and sampled by normalised position, so

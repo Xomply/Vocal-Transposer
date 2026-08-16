@@ -74,6 +74,7 @@ if(VH_BUILD_TESTS)
     tests/test_yin.cpp
     tests/test_engine.cpp
     tests/test_shifters.cpp
+    tests/test_continuity.cpp
   )
   target_link_libraries(vh_tests PRIVATE vh_core doctest::doctest)
 
@@ -116,4 +117,11 @@ if(VH_BUILD_OFFLINE)
   add_executable(vh_sweep tools/sweep.cpp)
   target_link_libraries(vh_sweep PRIVATE vh_core)
   target_include_directories(vh_sweep PRIVATE tools)
+
+  # vh_sweep plus a per-block CSV of what the analyser believed. Exists because BUGS.md
+  # VH-002 names an experiment — correlate click timestamps against the epoch series and
+  # the per-block period — that could not be run without a log. See tools/trace.cpp.
+  add_executable(vh_trace tools/trace.cpp)
+  target_link_libraries(vh_trace PRIVATE vh_core)
+  target_include_directories(vh_trace PRIVATE tools)
 endif()

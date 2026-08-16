@@ -233,3 +233,126 @@ The pattern across all three: **real input is not merely noisier than synthetic 
 is structurally different.** It starts from silence, it arrives before you are ready for
 it, and it has stretches where the model does not apply. None of those are captured by
 "add noise to a sine".
+
+---
+
+# Milestone 2 — the voicing model
+
+*Everything in this section was produced by `tools/model_sweep.py` on synthetic probe tones
+from `tools/make_probe_tones.py`, measured by `tools/voice_probe.py`. Reproduce with:*
+
+```bash
+python3 tools/make_probe_tones.py probe/
+python3 tools/model_sweep.py ./build/vh_sweep sweepout/ probe/*.wav
+```
+
+*The probes are synthetic and therefore flatter an engine built on the source-filter model,
+exactly as `HANDOVER.md` §4 says about `tools/voice.hpp`. They isolate mechanisms. They do
+not tell you whether it sounds good — the WAVs in `sweepout/wav/` do.*
+
+## What changed
+
+Three changes, in `core/src/psola_shifter.cpp` and `core/include/vh/voicing.hpp`:
+
+1. **Overlap-add gain is now 1.0**, derived rather than approximated. This is VH-003.
+2. **Grain content is resampled by mu = ratio^0.3**, giving independent formant control.
+3. **A source tilt shelf** approximates the open-quotient correction.
+
+Configurations below: `hold` is the pre-profile engine (bit-identical control), `mu` adds
+the formant curve, `mu+tilt` adds the open-quotient shelf, `granular` is the resampling
+engine as the far end of the exponent.
+
+## VH-003 is fixed, and it was the gain expression
+
+Upward level, 242 Hz probe, relative to dry:
+
+| interval | before (S/H) | after (1.0) |
+|---|---|---|
+| +7 st | −6.1 dB | −0.4 dB |
+| +12 st | — | **+2.6 dB** |
+| +19 st | — | **+2.1 dB** |
+
+Upward output is now slightly *louder* than dry, which is the physically correct outcome:
+raising pitch fires the glottis more often at the same strength. `vh_bench` cents error
+improved as a side effect (PSOLA at +12 st on a 110 Hz source: +2.0 → +0.3).
+
+## mu does exactly what the model predicts
+
+Duty should rise by 1/mu and pitch should not move at all. Measured, 242 Hz probe:
+
+| interval | mu | duty hold | duty with mu | ratio | predicted 1/mu | cents shift |
+|---|---|---|---|---|---|---|
+| −7 st | 0.90 | 0.76 | 0.87 | 1.14 | 1.11 | 0 |
+| −12 st | 0.81 | 0.62 | 0.74 | 1.19 | 1.23 | 0 |
+| −24 st | 0.66 | 0.31 | 0.47 | 1.52 | 1.52 | 0 |
+
+**The −24 st row matches the prediction to two decimal places, and the pitch does not move
+by a single cent.** That is the central claim of `VOICE-MODEL.md` §5 — that PSOLA already
+decoupled pitch from grain content and nobody had used it — confirmed by measurement.
+
+Envelope distance from dry grows with mu as it must (−24 st: 4.4 dB held, 9.6 dB with mu,
+13.7 dB for full resampling), and mu sits strictly between the two engines everywhere.
+
+## The C1 prediction is NOT confirmed. It is also not refuted.
+
+`VOICE-MODEL.md` C1 predicts that downward quality is bound by SOURCE pitch rather than by
+ratio, because a grain carries only `2/F0_source` seconds of tract ring. The probe tones
+were built to test exactly that: 90, 242 and 814 Hz, identical in every other respect.
+
+**No metric in the harness separates it.** At −24 st the three sources give duty 0.44 /
+0.31 / 0.35 and cents error +2410 / −4 / +0 — and the 90 Hz outlier is the ruler, not the
+engine, because 90 Hz down two octaves is 22 Hz and below the estimator's floor. Envelope
+contrast, added specifically to catch formant smearing, *rises* with downward shift on all
+three sources, because a denser harmonic comb adds ripple to the liftered envelope and
+swamps the effect being looked for.
+
+**What was ruled out:** it is not that the effect is absent — nothing here measures ring
+truncation. Duty measures excitation shape, distance measures whether the envelope moved,
+contrast is confounded by harmonic density. The prediction needs either a listening test on
+`sweepout/wav/` or a metric that isolates the decay envelope within one output period.
+Logged as VH-010.
+
+This is recorded rather than quietly dropped because a plausible prediction with no
+supporting measurement is exactly the shape of the thing that later gets cited as fact.
+
+## What got worse: peaks
+
+| source | interval | config | peak |
+|---|---|---|---|
+| 90 Hz | +19 st | mu+tilt | **1.00** |
+| 814 Hz | +12 st | mu+tilt | **1.00** |
+| 814 Hz | +19 st | hold | **1.00** |
+| demo, 4 voices | blend | — | 0.981 |
+
+Upward shifts now clip. Two causes stack: the VH-003 fix removed an attenuation that was
+masking it, and the tilt shelf boosts the upper band on upward shifts. Logged as VH-009,
+severity S1, because a clipped sample is destroyed audio rather than a mix decision.
+
+## CPU
+
+The cubic interpolation in `placeGrain` is per output sample and is not free.
+
+| configuration | before | after |
+|---|---|---|
+| 16 voices, both engines, 64 | 12.2% | **18.0%** |
+| 8 voices, psola, 128 | 12.6% | 10.9% |
+
+Still inside the 50% headroom target, and the 64-sample figure is the one that matters.
+The `unity` fast path means `voicing.enabled = false` costs nothing.
+
+## Listening material
+
+`sweepout/wav/` holds 108 renders: three sources x nine intervals x four configs, named
+`source__interval__config.wav` so any two are directly comparable. `sweepout/png/` holds
+spectrogram-and-waveform grids, all four configs side by side per cell.
+
+**Listen in this order:**
+
+1. `probe_242hz__-24st__hold.wav` then `__mu.wav`. This is the whole change in one A/B.
+2. `__mu.wav` then `__mu+tilt.wav` at the same cell — is the tilt an improvement or just
+   darker? That is `VOICE-MODEL.md` §7 Q4 and it is a listening question.
+3. `probe_90hz__-12st__*` against `probe_814hz__-12st__*`. Same interval, different source
+   pitch. If C1 is real you will hear it here even though no metric caught it.
+4. Sweep the exponent by hand where it matters:
+   `./build/vh_sweep in.wav out.wav psola -12 0.5 1` — muStrength 0.5 is halfway between
+   holding formants and the derived curve.

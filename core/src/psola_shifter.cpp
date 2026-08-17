@@ -11,18 +11,6 @@ namespace {
 // Longest period we ever handle: the 70 Hz lower bound of the tracker.
 constexpr double kLowestF0 = 70.0;
 constexpr int kWindowTableSize = 2048;
-
-// PROVISIONAL: 8 ms to hand over between the grain path and passthrough.
-//
-// Chosen to match the Engine's note envelope, which has been long enough to remove a click
-// since the first milestone, and short enough that a plosive still reads as a plosive. The
-// trade is explicit: longer is smoother and smears the consonant, shorter is tighter and
-// eventually clicks again. The two paths carry the SAME event at slightly different
-// pitches, so the smear is a doubling rather than a blur — which is why this can be as
-// short as it is.
-//
-// TUNE BY EAR on /t/ and /k/ before anything else in this file.
-constexpr double kHandoverMs = 8.0;
 } // namespace
 
 void PsolaShifter::prepare(double sampleRate, FrameCount maxBlock) {
@@ -44,11 +32,11 @@ void PsolaShifter::prepare(double sampleRate, FrameCount maxBlock) {
     window_.resize(kWindowTableSize);
     for (int i = 0; i < kWindowTableSize; ++i) {
         const double t = static_cast<double>(i) / (kWindowTableSize - 1);
-        window_[static_cast<size_t>(i)] = static_cast<float>(0.5 - 0.5 * std::cos(2.0 * M_PI * t));
+        window_[static_cast<size_t>(i)] = static_cast<float>(0.5 - 0.5 * std::cos(2.0 * kPi * t));
     }
 
     through_.assign(maxBlock, Sample{0});
-    mixStep_ = 1.0 / (kHandoverMs * 0.001 * sampleRate);
+    mixStep_ = 1.0 / (handoverMs_ * 0.001 * sampleRate);
 
     latency_ = 2 * maxHalf_;
     reset();
@@ -214,8 +202,8 @@ void PsolaShifter::applySourceTilt(const ShiftRequest& req, const AnalysisFrame&
     const double nyq = 0.45 * sampleRate_;
     const double fT = std::clamp(cornerTgt, 20.0, nyq);
     const double fS = std::clamp(cornerSrc, 20.0, nyq);
-    const double kT = 1.0 - std::exp(-2.0 * M_PI * fT / sampleRate_);
-    const double kS = 1.0 - std::exp(-2.0 * M_PI * fS / sampleRate_);
+    const double kT = 1.0 - std::exp(-2.0 * kPi * fT / sampleRate_);
+    const double kS = 1.0 - std::exp(-2.0 * kPi * fS / sampleRate_);
 
     if (!tiltPrimed_) { tiltG_ = gTarget; tiltKT_ = kT; tiltKS_ = kS; tiltPrimed_ = true; }
 
@@ -282,7 +270,16 @@ void PsolaShifter::process(const ShiftRequest& req) noexcept {
     // the wrong shape for the answer. k = 0 gives mu = 1 and this engine behaves exactly
     // as it did before the profile existed; k = 1 gives mu = ratio, which is the granular
     // engine. See vh/voicing.hpp for the derivation and VOICE-MODEL.md §6 for why.
-    const double mu = req.preservation->voicing.muFor(ratio);
+    // req.muScale carries Humanization::envelopeWarpOffset (app-design.md §5.2), applied
+    // AFTER muFor() and re-clamped against the SAME muMin/muMax voicing.hpp already uses --
+    // those clamps are a numerical guard against the overlap-add accumulator, not a taste
+    // statement, and a per-voice offset must not be able to defeat it. At the default
+    // muScale == 1.0 this is `clamp(muFor(ratio), muMin, muMax)`, which muFor() already
+    // returned, so the clamp is a bit-exact no-op and this line changes nothing from the
+    // pre-humanization engine.
+    const double mu = std::clamp(req.preservation->voicing.muFor(ratio) * req.muScale,
+                                 static_cast<double>(req.preservation->voicing.muMin),
+                                 static_cast<double>(req.preservation->voicing.muMax));
 
     // Output half-length. The grain reads halfOut * mu == halfSrc samples of SOURCE either
     // side of the epoch regardless of mu, so the ring lookahead in latencySamples() stays
@@ -481,7 +478,7 @@ void PsolaShifter::process(const ShiftRequest& req) noexcept {
         else if (mix_ > target) mix_ = std::max(target, mix_ - mixStep_);
 
         // Raised cosine on the linear ramp: zero slope at both ends.
-        const float g = static_cast<float>(0.5 - 0.5 * std::cos(M_PI * mix_));
+        const float g = static_cast<float>(0.5 - 0.5 * std::cos(kPi * mix_));
 
         // EQUAL-GAIN, matching the engine blend's normalisation rather than an equal-power
         // law. The two paths carry the same event, so on a voiced->voiced handover (the
@@ -498,6 +495,22 @@ void PsolaShifter::process(const ShiftRequest& req) noexcept {
     }
 
     if (!cur.frozen) cur.next += n;
+}
+
+void PsolaShifter::setTuning(const ShifterTuning& t) noexcept {
+    VH_RT_SECTION();
+
+    // Defensive floor independent of Tuning::clamp() (tuning.hpp). setTuning() is a public
+    // entry point any caller — a tool, a test, a future automation lane — can reach
+    // directly, not only through Engine::applyTuning()'s clamp(). At handoverMs <= 0 the
+    // divide below would make mixStep_ +inf; not a memory-safety hazard (every use of mix_
+    // downstream is clamped against a finite target via std::min/max, so no NaN or Inf ever
+    // reaches req.out), but it would silently defeat the entire point of this field — the
+    // C1 crossfade that replaced the branch BUGS.md VH-002 found four copies of.
+    const double ms = t.psola.handoverMs > 1e-3f ? static_cast<double>(t.psola.handoverMs)
+                                                  : 1e-3;
+    handoverMs_ = ms;
+    mixStep_ = 1.0 / (handoverMs_ * 0.001 * sampleRate_);
 }
 
 } // namespace vh

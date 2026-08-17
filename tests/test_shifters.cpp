@@ -43,13 +43,13 @@ std::vector<Sample> synthVoice(double f0, FrameCount n,
         const int width = static_cast<int>(period * 0.3);
         for (int k = 0; k < width && start + k < static_cast<int>(n); ++k) {
             const double t = static_cast<double>(k) / width;
-            exc[static_cast<size_t>(start + k)] += 0.5 - 0.5 * std::cos(2.0 * M_PI * t);
+            exc[static_cast<size_t>(start + k)] += 0.5 - 0.5 * std::cos(2.0 * kPi * t);
         }
     }
 
     auto resonate = [&](double fc, double bw, double amp) {
-        const double r = std::exp(-M_PI * bw / kSR);
-        const double theta = 2.0 * M_PI * fc / kSR;
+        const double r = std::exp(-kPi * bw / kSR);
+        const double theta = 2.0 * kPi * fc / kSR;
         const double a1 = -2.0 * r * std::cos(theta);
         const double a2 = r * r;
         double z1 = 0.0, z2 = 0.0;
@@ -100,8 +100,8 @@ double bandEnergy(const std::vector<Sample>& sig, double flo, double fhi,
         for (FrameCount i = 0; i < len && from + i < sig.size(); ++i) {
             const double t = static_cast<double>(i);
             // Hann, or the rectangular window's sidelobes swamp the measurement.
-            const double w = 0.5 - 0.5 * std::cos(2.0 * M_PI * t / static_cast<double>(len));
-            acc += std::polar(w * static_cast<double>(sig[from + i]), -2.0 * M_PI * f * t / kSR);
+            const double w = 0.5 - 0.5 * std::cos(2.0 * kPi * t / static_cast<double>(len));
+            acc += std::polar(w * static_cast<double>(sig[from + i]), -2.0 * kPi * f * t / kSR);
         }
         const double m = std::abs(acc) / static_cast<double>(len);
         total += m * m;
@@ -443,4 +443,70 @@ TEST_CASE("output stays finite across extreme ratios") {
         for (auto x : render(g, in, r)) REQUIRE(std::isfinite(x));
         for (auto x : render(p, in, r)) REQUIRE(std::isfinite(x));
     }
+}
+
+// ============================================================================
+// setTuning(): proving the derived, prepare()-baked values actually recompute rather than
+// leaving the knob silently inert (app-design.md §4.1).
+// ============================================================================
+
+TEST_CASE("PsolaShifter::setTuning recomputes mixStep_ from the new handoverMs") {
+    PsolaShifter p;
+    p.prepare(kSR, kBlock);
+    const double defaultStep = p.mixStepPerSample();
+    CHECK(defaultStep == doctest::Approx(1.0 / (0.001 * 8.0 * kSR)));   // kHandoverMs == 8 ms
+
+    ShifterTuning t{};
+    t.psola.handoverMs = 1.0f;   // much shorter handover than the 8 ms default
+    p.setTuning(t);
+    CHECK(p.mixStepPerSample() == doctest::Approx(1.0 / (0.001 * 1.0 * kSR)));
+    CHECK(p.mixStepPerSample() > defaultStep);   // shorter handover -> bigger per-sample step
+
+    // A caller reaching setTuning() directly, bypassing Tuning::clamp() entirely, must not
+    // be able to drive mixStep_ to +inf via a divide by zero.
+    ShifterTuning zero{};
+    zero.psola.handoverMs = 0.0f;
+    p.setTuning(zero);
+    CHECK(std::isfinite(p.mixStepPerSample()));
+    CHECK(p.mixStepPerSample() > 0.0);
+}
+
+TEST_CASE("GranularShifter::setTuning changes cfg_, and updateGeometry() reads it live") {
+    // GranularConfig IS GranularTuning now (granular_shifter.hpp), so setTuning() is a
+    // plain struct copy with nothing to recompute explicitly -- this pins that the copy
+    // actually lands somewhere updateGeometry() reads, using jumpPeriods (which scales
+    // jumpSize_, and therefore baseDelay_ == latencySamples()) as the observable.
+    GranularShifter g;
+    g.prepare(kSR, kBlock);
+
+    AudioRing ring(1 << 15);
+    std::vector<Sample> silence(kBlock, 0.0f);
+    ring.write(silence.data(), kBlock);
+
+    AnalysisFrame a{};
+    a.voicing = Voicing::Voiced;
+    a.periodSamples = 200.0f;   // 240 Hz at 48 kHz -- a real geometry to size against
+
+    ReadCursor cur{};
+    std::vector<Sample> blk(kBlock, 0.0f);
+    ShiftRequest req{};
+    req.ring = &ring;
+    req.analysis = &a;
+    req.cursor = &cur;
+    PreservationSpec pres{};
+    req.preservation = &pres;
+    req.ratio = 1.0;
+    req.out = blk.data();
+    req.numFrames = kBlock;
+
+    g.process(req);
+    const FrameCount defaultLatency = g.latencySamples();
+
+    ShifterTuning t{};
+    t.granular.jumpPeriods = 6;   // default is 1
+    g.setTuning(t);
+    g.process(req);
+    const FrameCount newLatency = g.latencySamples();
+
+    CHECK(newLatency > defaultLatency);
 }

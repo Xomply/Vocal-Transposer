@@ -97,7 +97,7 @@ inline std::vector<vh::Sample> renderPhrase(const std::vector<PhraseSegment>& ph
             }
 
             const double vib = seg.vibratoDepthCents *
-                               std::sin(2.0 * M_PI * 5.6 * t) *
+                               std::sin(2.0 * vh::kPi * 5.6 * t) *
                                std::min(1.0, t / 0.25);   // vibrato fades in, as singers do
             f0[i] = 440.0 * std::pow(2.0, (seg.midiNote - 69.0 + vib / 100.0) / 12.0);
             amp[i] = env;
@@ -132,7 +132,7 @@ inline std::vector<vh::Sample> renderPhrase(const std::vector<PhraseSegment>& ph
                 const int width = std::max(2, static_cast<int>(period * 0.35));
                 for (int k = 0; k < width && i + static_cast<size_t>(k) < n; ++k) {
                     const double tt = static_cast<double>(k) / width;
-                    exc[i + static_cast<size_t>(k)] += (0.5 - 0.5 * std::cos(2.0 * M_PI * tt)) * amp[i];
+                    exc[i + static_cast<size_t>(k)] += (0.5 - 0.5 * std::cos(2.0 * vh::kPi * tt)) * amp[i];
                 }
             }
             // A little aspiration noise even on voiced frames — real voices are never
@@ -152,8 +152,8 @@ inline std::vector<vh::Sample> renderPhrase(const std::vector<PhraseSegment>& ph
     auto resonate = [&](const std::vector<double>& fc, double bw, double gain) {
         double z1 = 0.0, z2 = 0.0;
         for (size_t i = 0; i < n; ++i) {
-            const double r = std::exp(-M_PI * bw / sr);
-            const double theta = 2.0 * M_PI * fc[i] / sr;
+            const double r = std::exp(-vh::kPi * bw / sr);
+            const double theta = 2.0 * vh::kPi * fc[i] / sr;
             const double a1 = -2.0 * r * std::cos(theta);
             const double a2 = r * r;
             const double y = exc[i] - a1 * z1 - a2 * z2;

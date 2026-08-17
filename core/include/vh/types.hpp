@@ -58,6 +58,20 @@ inline constexpr int kMaxVoices = 16;
 // sounds looped.
 inline constexpr FrameCount kInputHistoryFrames = 96000;
 
+// CERTAIN, and it is here rather than taken from <cmath> for a reason worth recording:
+// M_PI is POSIX, not ISO C++. MSVC does not define it unless _USE_MATH_DEFINES is set
+// BEFORE <cmath>, so every M_PI in this codebase was a Windows build failure — which went
+// unnoticed for the project's whole life because development happened on GCC/Clang and
+// HANDOVER.md only ever said MSVC was "not yet verified". It is now: it did not compile.
+//
+// WHY NOT a _USE_MATH_DEFINES compile definition, which is the one-line fix: epoch.hpp is a
+// PUBLIC header, and a public header that compiles only when its consumer happens to have
+// set a macro is a trap for whoever includes it next — including the JUCE app, which is
+// exactly who found this. C++20's std::numbers::pi would serve equally well; a project
+// constant is chosen for consistency with the constants below and to keep <numbers> out of
+// every translation unit that needs a cosine.
+inline constexpr double kPi = 3.14159265358979323846;
+
 // Musical constants.
 inline constexpr double kSemitoneRatio = 1.0594630943592953;  // 2^(1/12)
 inline constexpr double kCentsPerOctave = 1200.0;

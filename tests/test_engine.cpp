@@ -7,6 +7,7 @@
 #include "vh/yin.hpp"
 
 #include <cmath>
+#include <string>
 #include <vector>
 
 using namespace vh;
@@ -21,7 +22,7 @@ std::vector<Sample> tone(double f0, FrameCount n) {
     for (FrameCount i = 0; i < n; ++i) {
         double s = 0.0;
         for (int k = 1; k <= 6; ++k)
-            s += std::sin(2.0 * M_PI * f0 * k * static_cast<double>(i) / kSR) / k;
+            s += std::sin(2.0 * kPi * f0 * k * static_cast<double>(i) / kSR) / k;
         v[i] = static_cast<Sample>(s * 0.2);
     }
     return v;
@@ -186,9 +187,18 @@ TEST_CASE("blend weights always sum to one") {
     CHECK(zero.fast + zero.quality == doctest::Approx(1.0f));   // degenerate case is safe
 }
 
-TEST_CASE("sustain freezes a voice by stalling its cursor") {
+// app-design.md §5.1: the old "sustain freezes a voice by stalling its cursor" test named
+// a single control that actually did two separable things — deferred note-off AND cursor
+// stall. setSustain is REMOVED (not kept as an alias: two names for divergent behaviours is
+// how this becomes a bug in six months) in favour of setHold (conventional sustain) and
+// setFreeze (its own control). Split into the two tests below, one per behaviour.
+
+TEST_CASE("hold defers note-off but keeps the voice tracking live input") {
+    // Conventional sustain: the voice must NOT be latched or have its cursor stalled — it
+    // keeps reading live input exactly like an unreleased note, and only the RELEASE is
+    // deferred until setHold(false).
     auto e = makeEngine(RatioSource::IntervalFromRoot);
-    e->setSustain(true);
+    e->setHold(true);
     e->noteOn(60, 1.0f);
 
     const auto sig = tone(180.0, 24000);
@@ -198,9 +208,74 @@ TEST_CASE("sustain freezes a voice by stalling its cursor") {
     e->noteOff(60);
     CHECK(e->activeVoiceCount() == 1);      // held, not released
 
-    e->setSustain(false);
+    e->setHold(false);
+    pump(*e, sig, out);
+    CHECK(e->activeVoiceCount() == 0);      // released once hold lets go
+}
+
+TEST_CASE("freeze latches a sounding voice and stalls its cursor into a loop window") {
+    // On engage, freeze grabs whatever is SOUNDING right now: the voice stops responding to
+    // note-off (latched) and its cursor stops chasing the write head (stalled). On release,
+    // every latched voice moves to Releasing — a captured pad, not a silent hold.
+    auto e = makeEngine(RatioSource::IntervalFromRoot);
+    e->noteOn(60, 1.0f);
+
+    const auto sig = tone(180.0, 24000);
+    std::vector<Sample> out;
+    pump(*e, sig, out);
+
+    e->setFreeze(true);
+    e->noteOff(60);                          // ignored entirely while latched
+    CHECK(e->activeVoiceCount() == 1);
+
+    pump(*e, sig, out);                      // still sounding, looping the captured window
+    CHECK(e->activeVoiceCount() == 1);
+
+    e->setFreeze(false);
+    CHECK(e->activeVoiceCount() == 1);       // moved to Releasing, not yet silent
+    pump(*e, sig, out);
+    CHECK(e->activeVoiceCount() == 0);       // and now fully released
+}
+
+TEST_CASE("freeze wins on cursor behaviour when hold and freeze are both engaged") {
+    // Both controls may be engaged at once (app-design.md §5.1). A voice that is both
+    // hold-deferred-eligible and freeze-latched must have its CURSOR stalled (freeze wins),
+    // and releasing freeze must move it to Releasing even though hold is still held down —
+    // freeze does not defer to hold's bookkeeping, it overrides note-off handling entirely.
+    auto e = makeEngine(RatioSource::IntervalFromRoot);
+    e->setHold(true);
+    e->noteOn(60, 1.0f);
+
+    const auto sig = tone(180.0, 24000);
+    std::vector<Sample> out;
+    pump(*e, sig, out);
+
+    e->setFreeze(true);
+    e->noteOff(60);                          // latched: ignored, not deferred by hold either
+    CHECK(e->activeVoiceCount() == 1);
+
+    e->setFreeze(false);                     // releases the latch regardless of hold_ still
+                                              // being engaged
     pump(*e, sig, out);
     CHECK(e->activeVoiceCount() == 0);
+}
+
+TEST_CASE("allNotesOff cuts through hold and freeze latching") {
+    // Panic must override both controls -- it is an emergency stop, not a note-off.
+    auto e = makeEngine(RatioSource::IntervalFromRoot);
+    e->setHold(true);
+    e->setFreeze(true);
+    e->noteOn(60, 1.0f);
+    e->noteOn(64, 1.0f);
+
+    const auto sig = tone(180.0, 24000);
+    std::vector<Sample> out;
+    pump(*e, sig, out);
+    CHECK(e->activeVoiceCount() == 2);
+
+    e->allNotesOff();
+    pump(*e, sig, out);
+    CHECK(e->activeVoiceCount() == 0);       // released (through the envelope), not stuck
 }
 
 TEST_CASE("a full block with many voices allocates nothing") {
@@ -368,4 +443,99 @@ TEST_CASE("reported latency reflects the mode") {
     YinAnalyzer probe;
     probe.prepare(kSR, kBlock);
     CHECK(a->latencySamples() - b->latencySamples() == probe.latencySamples());
+}
+
+TEST_CASE("steady-state and acquisition latency are the two figures BUGS.md VH-012 asks for") {
+    // VH-012: the single latencySamples() figure above sums YIN's analysis window (a
+    // CONVERGENCE cost, paid once when the tracker locks) into the shifters' transport
+    // delay for Mode A, over-reporting Mode A's STEADY-STATE latency by roughly that whole
+    // window (~28.6 ms at the 70 Hz floor). This pins the split:
+    //   - latencySamples() is UNCHANGED and equals acquisitionLatencySamples() — every
+    //     existing caller (offline/main.cpp, the JUCE app, this test file above) keeps
+    //     seeing exactly the number it always saw.
+    //   - steadyStateLatencySamples() is the corrected figure: max(fast,quality) + decor,
+    //     with NO analyser term, correct for both modes once a voice is actually running.
+    //   - acquisitionLatencySamples() == steadyState + (Mode A only) the analyser's window.
+    auto a = makeEngine(RatioSource::AbsoluteTarget);
+    auto b = makeEngine(RatioSource::IntervalFromRoot);
+
+    CHECK(a->latencySamples() == a->acquisitionLatencySamples());
+    CHECK(a->steadyStateLatencySamples() < a->acquisitionLatencySamples());   // Mode A pays the window
+    CHECK(a->steadyStateLatencySamples() == b->steadyStateLatencySamples());  // identical once locked
+    CHECK(b->acquisitionLatencySamples() == b->steadyStateLatencySamples());  // Mode B pays none
+
+    YinAnalyzer probe;
+    probe.prepare(kSR, kBlock);
+    CHECK(a->acquisitionLatencySamples() - a->steadyStateLatencySamples() == probe.latencySamples());
+}
+
+// ============================================================================
+// alignAmount_ snap-vs-ramp (app-design.md §4.5 item 5 / §5's resolution). Every existing
+// offline tool sets alignment exactly once, before any process() call, and must keep seeing
+// the old bit-identical step behaviour; a live change made while audio is already flowing
+// must ramp instead, so a UI slider mid-performance does not jump the delay tap.
+// ============================================================================
+
+TEST_CASE("blend alignment snaps when the engine has not yet processed any block") {
+    auto e = makeEngine(RatioSource::IntervalFromRoot);
+    e->setBlendAlignment(0.7f);
+    // No process() call at all -- "the engine is not yet running" is satisfied trivially,
+    // and the value must already be the target, not merely queued toward it.
+    CHECK(e->blendAlignment() == doctest::Approx(0.7f));
+}
+
+TEST_CASE("the FIRST alignment change after prepare() snaps even if a block was already processed") {
+    auto e = makeEngine(RatioSource::IntervalFromRoot);
+    std::vector<Sample> silence(kBlock, 0.0f), out(kBlock, 0.0f);
+    e->process(silence.data(), out.data(), kBlock);   // the engine is now "running"
+
+    e->setBlendAlignment(0.85f);   // still the FIRST call to set alignment since prepare()
+    CHECK(e->blendAlignment() == doctest::Approx(0.85f));   // snapped, not queued
+}
+
+TEST_CASE("a SECOND alignment change while the engine is running ramps rather than snaps") {
+    auto e = makeEngine(RatioSource::IntervalFromRoot);
+    std::vector<Sample> silence(kBlock, 0.0f), out(kBlock, 0.0f);
+
+    e->setBlendAlignment(0.3f);   // first application: snaps (matches every offline tool)
+    e->process(silence.data(), out.data(), kBlock);
+    CHECK(e->blendAlignment() == doctest::Approx(0.3f));
+
+    e->setBlendAlignment(0.9f);   // SECOND application, engine already running
+    // The call itself must not jump the value -- that is the whole point of the ramp.
+    CHECK(e->blendAlignment() == doctest::Approx(0.3f));
+
+    e->process(silence.data(), out.data(), kBlock);
+    const float afterOneBlock = e->blendAlignment();
+    CHECK(afterOneBlock > 0.3f);
+    CHECK(afterOneBlock < 0.9f);   // moved toward the target, not snapped onto it
+
+    // Well past the ~50 ms ramp time (128/48000 s per block * 100 blocks ~= 267 ms).
+    for (int i = 0; i < 100; ++i) e->process(silence.data(), out.data(), kBlock);
+    CHECK(e->blendAlignment() == doctest::Approx(0.9f));   // converges to the target eventually
+}
+
+TEST_CASE("re-preparing the engine makes the next alignment change snap again") {
+    // A second prepare() (e.g. a sample-rate change) must reset the primed/running flags --
+    // otherwise a live ramp set up against the OLD buffers would carry over into freshly
+    // (re)sized ones with no audio having flowed through them yet.
+    Engine e;
+    EngineConfig cfg;
+    cfg.sampleRate = kSR;
+    cfg.maxBlock = kBlock;
+    cfg.ratioSource = RatioSource::IntervalFromRoot;
+    e.prepare(cfg, std::make_unique<YinAnalyzer>(),
+              []() { return std::make_unique<PassthroughShifter>(); }, nullptr);
+
+    std::vector<Sample> silence(kBlock, 0.0f), out(kBlock, 0.0f);
+    e.setBlendAlignment(0.3f);
+    e.process(silence.data(), out.data(), kBlock);
+    e.setBlendAlignment(0.9f);   // now ramping, per the test above
+    e.process(silence.data(), out.data(), kBlock);
+    CHECK(e.blendAlignment() < 0.9f);   // confirm it is genuinely mid-ramp before re-preparing
+
+    e.prepare(cfg, std::make_unique<YinAnalyzer>(),
+              []() { return std::make_unique<PassthroughShifter>(); }, nullptr);
+    e.setBlendAlignment(0.5f);
+    CHECK(e.blendAlignment() == doctest::Approx(0.5f));   // snapped, first application again
 }

@@ -10,8 +10,10 @@ Then:
   Which properties must change with pitch, which must be protected from changing, and which
   cannot be recovered from the recording at all. Read this before touching an engine.
 - `ARCHITECTURE.md` — module-by-module reasoning, seams, confidence markers
+- `docs/app-design.md` — the standalone instrument: device selection, the live parameter
+  model, profiles, and which parameters can be changed while audio runs versus which need a
+  restart. Read this before touching `app/` or adding a parameter.
 - `RESULTS.md` — measurements and listening guide
-- `BUGS.md` — the ledger of defects found but not yet fixed
 - `BUGS.md` — open defects with status (Backlog / Doing / In review / Done). Log
   anything you find and cannot fix in scope; do not drop it and do not detour.
 

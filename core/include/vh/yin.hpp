@@ -111,8 +111,18 @@ public:
     FrameCount latencySamples() const noexcept override { return windowSamples_; }
     void forceReacquire() noexcept override { holdSamples_ = 0; frame_.f0IsHeld = false; }
 
+    // Audio thread. Non-allocating. Applies every BEHAVIOURAL field of AnalyzerTuning;
+    // minHz/maxHz are deliberately NOT read here — see AnalyzerTuning's own comment
+    // (analysis.hpp) and app-design.md §4.1: they size window_/decimated_/diff_/cmnd_ in
+    // prepare(), and applying them post-prepare would either be silently inert (this
+    // function never resizes those buffers) or, if it DID resize them here, would be doing
+    // an allocation from what Engine::applyTuning() calls on the audio thread — restart-only
+    // stays restart-only on purpose.
+    void setTuning(const AnalyzerTuning& t) noexcept override;
+
     // Exposed for tests and for the offline harness. Not used on the audio thread.
     FrameCount windowSamples() const noexcept { return windowSamples_; }
+    FrameCount maxHoldSamples() const noexcept { return maxHoldSamples_; }
 
 private:
     // Returns period in samples, or 0 if no confident candidate.

@@ -15,6 +15,7 @@
 #include "vh/types.hpp"
 
 #include <cstdint>
+#include <type_traits>
 
 namespace vh {
 
@@ -106,6 +107,75 @@ struct AnalysisFrame {
     }
 };
 
+// --- AnalyzerTuning: the live parameters of IAnalyzer's concrete implementations --------
+//
+// LAYERING: lives here rather than in tuning.hpp for the identical reason ShifterTuning
+// lives in shifter.hpp (see that file's comment) — tuning.hpp includes voice.hpp includes
+// shifter.hpp includes THIS file, so tuning.hpp already sits downstream of analysis.hpp in
+// the include graph. Defining AnalyzerTuning in tuning.hpp and having IAnalyzer::setTuning
+// reference it here would close the same kind of circular include ShifterTuning's move was
+// written up to avoid. IAnalyzer defines the tuning struct it needs; tuning.hpp includes
+// this file and aggregates it, one direction only.
+//
+// minHz/maxHz are DELIBERATELY ABSENT. They size the analysis window (yin.cpp:
+// minTau_/maxTau_ -> windowSamples_ -> window_/decimated_/diff_/cmnd_, all allocated in
+// prepare()). Per app-design.md §4.1 changing them without a restart is INERT —
+// YinAnalyzer::process() never re-reads them — not wrong, not crashing, just a knob that
+// visibly turns and does nothing. §5.8's rule ("a knob that does nothing is worse than a
+// missing knob") applies here for a buffer-sizing reason rather than a no-reader one.
+struct AnalyzerTuning {
+    float threshold = 0.15f;              // YinConfig::threshold (yin.hpp)
+    FrameCount hopSamples = 128;          // YinConfig::hopSamples (yin.hpp) — see
+                                           // Tuning::clamp() (tuning.hpp): AT ZERO this
+                                           // hangs the audio thread (yin.cpp's analysis
+                                           // hop loop never advances).
+    bool holdThroughUnvoiced = true;      // YinConfig::holdThroughUnvoiced (yin.hpp)
+    float maxHoldMs = 200.0f;             // YinConfig::maxHoldMs (yin.hpp) — feeds
+                                           // maxHoldSamples_ (yin.cpp); YinAnalyzer::
+                                           // setTuning() recomputes it on change per
+                                           // app-design.md §4.1, same reasoning as
+                                           // PsolaTuning::handoverMs (shifter.hpp).
+    int releaseHops = 4;                  // YinConfig::releaseHops (yin.hpp)
+    float maxStepCents = 120.0f;          // YinConfig::maxStepCents (yin.hpp)
+    int jumpConfirmHops = 2;              // YinConfig::jumpConfirmHops (yin.hpp)
+
+    // --- epoch tracker (epoch.hpp), promoted per app-design.md §5.7 --------------------
+    //
+    // epochCutoffRatio is the ONE parameter in this entire struct with a "commit on
+    // drag-release, not continuously" rule (app-design.md §4.5 item 4). EpochTracker::
+    // setCutoff calls sin/cos and is gated by 5% hysteresis specifically to rate-limit
+    // retuning and to avoid rewriting a running biquad's coefficients while z1_/z2_ still
+    // reflect the OLD ones. A UI that publishes a Tuning every frame during a slider drag
+    // defeats that gate if the field is applied carelessly — see EpochTracker::setTuning's
+    // own comment for how this is preserved on the core side. Whichever track builds the UI
+    // must still treat this field differently from every other one in the struct: publish
+    // only when the drag ends, not on every intermediate value. Nothing in `core` can
+    // enforce THAT half — it is a UI-thread discipline, recorded here because this is where
+    // the field lives.
+    float epochCutoffRatio = 1.8f;        // epoch.hpp
+    float epochLoudnessFactor = 0.25f;    // epoch.hpp
+    float epochRefractoryFactor = 0.6f;   // epoch.hpp
+    float epochEnvelopeRelease = 0.9995f; // epoch.hpp
+    float epochCutoffMinHz = 120.0f;      // epoch.hpp
+    float epochCutoffMaxHz = 1500.0f;     // epoch.hpp
+};
+
+namespace analyzer_tuning_detail {
+template <typename... Ts>
+inline constexpr bool none_are_pointers = (!std::is_pointer_v<Ts> && ...);
+} // namespace analyzer_tuning_detail
+
+static_assert(analyzer_tuning_detail::none_are_pointers<
+    decltype(AnalyzerTuning::threshold), decltype(AnalyzerTuning::hopSamples),
+    decltype(AnalyzerTuning::holdThroughUnvoiced), decltype(AnalyzerTuning::maxHoldMs),
+    decltype(AnalyzerTuning::releaseHops), decltype(AnalyzerTuning::maxStepCents),
+    decltype(AnalyzerTuning::jumpConfirmHops), decltype(AnalyzerTuning::epochCutoffRatio),
+    decltype(AnalyzerTuning::epochLoudnessFactor), decltype(AnalyzerTuning::epochRefractoryFactor),
+    decltype(AnalyzerTuning::epochEnvelopeRelease), decltype(AnalyzerTuning::epochCutoffMinHz),
+    decltype(AnalyzerTuning::epochCutoffMaxHz)>,
+    "AnalyzerTuning must contain no pointers -- Tuning (tuning.hpp) crosses the UI/audio "
+    "boundary by value inside TuningBus.");
+
 // Interface, not a base class to inherit behaviour from.
 //
 // WHY AN INTERFACE HERE (this is a deliberate dial, per the handover discipline):
@@ -141,6 +211,15 @@ public:
     // Force the next frame to be a fresh measurement rather than a held value.
     // Used when something upstream knows the pitch has genuinely changed.
     virtual void forceReacquire() noexcept = 0;
+
+    // Audio thread, via Engine::applyTuning(). Update the analyser's own live behavioural
+    // parameters. Non-allocating, no locks. Defaulted to a no-op, mirroring
+    // IPitchShifter::setTuning (shifter.hpp) — the only concrete IAnalyzer today is
+    // YinAnalyzer, but a future one (pYIN, a MIDI-informed analyser, HANDOVER.md §4) should
+    // not be forced to implement this merely to compile.
+    //
+    // minHz/maxHz are NOT here to be applied — see AnalyzerTuning's own comment above.
+    virtual void setTuning(const AnalyzerTuning&) noexcept {}
 };
 
 } // namespace vh

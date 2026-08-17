@@ -43,9 +43,11 @@ void GranularShifter::updateGeometry(float periodSamples, double sampleRate,
     // seams, each of which is a small discontinuity. The clicks were not caused by the wrong
     // pitch; they were caused by the geometry CHANGING.
     //
-    // A one-pole at ~20 ms absorbs estimator noise while still following a real glide (a
-    // portamento takes 100 ms or more, so the lag is a few percent of the excursion). If a
-    // future analyser is stable enough that this does nothing, it costs one multiply.
+    // A one-pole at ~20 ms (PROVISIONAL, cfg_.geometrySmoothMs — was a hardcoded literal,
+    // promoted to a live field per app-design.md §5.7) absorbs estimator noise while still
+    // following a real glide (a portamento takes 100 ms or more, so the lag is a few
+    // percent of the excursion). If a future analyser is stable enough that this does
+    // nothing, it costs one multiply.
     //
     // `elapsed` IS NOT OPTIONAL. This function runs once per BLOCK, not once per sample, so
     // a coefficient derived from the sample rate alone gives a time constant multiplied by
@@ -53,8 +55,9 @@ void GranularShifter::updateGeometry(float periodSamples, double sampleRate,
     // caught up with the singer, and the granular pitch test failed by 1971 cents. Written
     // that way first; the test suite caught it in one run, which is the entire argument for
     // `core` not needing a plugin host to be exercised.
+    const double smoothSec = std::max(static_cast<double>(cfg_.geometrySmoothMs) * 0.001, 1e-6);
     const double k = elapsed > 0
-        ? 1.0 - std::exp(-static_cast<double>(elapsed) / (0.020 * sampleRate))
+        ? 1.0 - std::exp(-static_cast<double>(elapsed) / (smoothSec * sampleRate))
         : 1.0;
     if (geoPeriod_ <= 0.0f) geoPeriod_ = raw;
     else geoPeriod_ += static_cast<float>(k) * (raw - geoPeriod_);
@@ -195,7 +198,7 @@ void GranularShifter::process(const ShiftRequest& req) noexcept {
             // partial can be born and die inaudibly if the envelope is C1 at the
             // boundaries; a fade with a kink in its derivative clicks no matter how long
             // it is.
-            const float g = 0.5f - 0.5f * std::cos(static_cast<float>(M_PI) * x);
+            const float g = 0.5f - 0.5f * std::cos(static_cast<float>(kPi) * x);
 
             const Sample old = interpolate(ring, fadePos_);
 
@@ -219,6 +222,16 @@ void GranularShifter::process(const ShiftRequest& req) noexcept {
     // pointer moves at `ratio` and jumps around, which is exactly why the two are separate
     // quantities. The blender aligns on the cursor.
     if (!cur.frozen) cur.next += req.numFrames;
+}
+
+void GranularShifter::setTuning(const ShifterTuning& t) noexcept {
+    VH_RT_SECTION();
+    // GranularConfig IS GranularTuning (granular_shifter.hpp), so this is a plain struct
+    // copy: no derived, prepare()-baked value here needs recomputing the way PSOLA's
+    // mixStep_ or YIN's maxHoldSamples_ do. updateGeometry() reads cfg_ fresh every block
+    // (it already has to, to track the singer), so a changed jumpPeriods/fadeFraction/
+    // unvoicedGrainMs/geometrySmoothMs takes effect on the very next block for free.
+    cfg_ = t.granular;
 }
 
 } // namespace vh

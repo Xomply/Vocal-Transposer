@@ -1,5 +1,10 @@
-# Build output
+# Build output. `build-app/` is a SECOND build directory rather than a variant of the
+# first: the JUCE app target fetches and compiles JUCE, which is slow, and keeping it
+# out of `build/` means the headless core/test build stays fast and can be wiped
+# independently. HANDOVER.md §9 requires rebuilding from scratch to verify a patch
+# series, and nobody does that willingly if it drags a framework build along with it.
 build/
+build-app/
 *.o
 *.a
 

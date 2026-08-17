@@ -44,7 +44,7 @@ std::vector<Sample> tone(double f0, FrameCount n, int partials = 8, double amp =
     for (FrameCount i = 0; i < n; ++i) {
         double s = 0.0;
         for (int k = 1; k <= partials; ++k)
-            s += std::sin(2.0 * M_PI * f0 * k * static_cast<double>(i) / kSR) / k;
+            s += std::sin(2.0 * kPi * f0 * k * static_cast<double>(i) / kSR) / k;
         v[i] = static_cast<Sample>(amp * s / 2.0);
     }
     return v;
@@ -81,7 +81,7 @@ void append(std::vector<Sample>& dst, const std::vector<Sample>& src) {
     const FrameCount start = dst.size() - overlap;
     for (FrameCount i = 0; i < overlap; ++i) {
         const double u = static_cast<double>(i) / static_cast<double>(overlap);
-        const double g = 0.5 - 0.5 * std::cos(M_PI * u);
+        const double g = 0.5 - 0.5 * std::cos(kPi * u);
         dst[start + i] = static_cast<Sample>(dst[start + i] * (1.0 - g) + src[i] * g);
     }
     dst.insert(dst.end(), src.begin() + static_cast<long>(overlap), src.end());

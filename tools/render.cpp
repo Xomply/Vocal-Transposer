@@ -6,18 +6,28 @@
 // perfectly periodic, clean voicing boundaries, no room, no breath, no creak.
 //
 // Usage:
-//   vh_render <in.wav> <outdir> <prefix> "<t>:<n>,<n>,<n>; <t>:<n>,<n>,<n>; ..."
+//   vh_render <in.wav> <outdir> <prefix> "<t>:<n>,<n>,<n>; <t>:<n>,<n>,<n>; ..." [rootMidi]
+//             [--profile <path>]
 //
 // where <t> is seconds and <n> are MIDI note numbers held from that time until the next
 // entry. Example: "0:60,64,67; 2.5:59,62,67"
 //
 // Renders the same variant set as the synthetic demo, so the two are directly comparable.
+//
+// --profile is ADDITIVE (app-design.md §7/Track E): every invocation above with no
+// --profile behaves exactly as it always did. When given, the profile's Tuning is applied
+// to EVERY variant via Engine::applyTuning() on top of that variant's own prepare()/
+// setBlendPolicy()/setBlendAlignment() calls -- see renderVariant()'s own comment for why
+// each variant's `mode`, `rootMidiNote` and `alignment` are reasserted AFTER applyTuning():
+// those three are the variables this tool exists to hold fixed while comparing engines, and
+// a profile does not get to silently change what a variant IS.
 
 #include "vh/engine.hpp"
 #include "vh/granular_shifter.hpp"
 #include "vh/psola_shifter.hpp"
 #include "vh/yin.hpp"
 
+#include "profile_cli.hpp"
 #include "wav.hpp"
 
 #include <cmath>
@@ -71,7 +81,8 @@ enum class Choice { Granular, Psola, Blend };
 std::vector<Sample> renderVariant(const std::vector<Sample>& dry, double sr,
                                   Choice choice, const std::vector<Chord>& chords,
                                   RatioSource mode, const IBlendPolicy& policy,
-                                  float alignment, bool includeDry, int rootNote) {
+                                  float alignment, bool includeDry, int rootNote,
+                                  const Tuning* profile) {
     Engine engine;
     EngineConfig cfg;
     cfg.sampleRate = sr;
@@ -90,6 +101,25 @@ std::vector<Sample> renderVariant(const std::vector<Sample>& dry, double sr,
     engine.setBlendPolicy(&policy);
     engine.setBlendAlignment(alignment);
 
+    if (profile != nullptr) {
+        // Apply everything the profile carries EXCEPT this variant's own defining
+        // identity: `mode` and `rootMidiNote` are what makes the "mode B (interval)" row
+        // different from the other five, and `alignment` is the very thing the "blend, no
+        // align" / "blend, aligned" pair exists to hold apart. Engine::applyTuning()
+        // (engine.cpp) writes cfg_.ratioSource, cfg_.rootMidiNote AND alignAmount_
+        // unconditionally from whatever Tuning it is given -- it has no way to know those
+        // three are this tool's fixed experimental variables rather than ordinary tunable
+        // parameters, so reasserting them here (mode/root before the call, alignment after)
+        // is this tool's job, not core's.
+        Tuning t = *profile;
+        t.mode = mode;
+        t.rootMidiNote = rootNote;
+        engine.applyTuning(t);
+        engine.setBlendAlignment(alignment);   // applyTuning() also wrote alignAmount_ =
+                                                // t.alignment; reassert AFTER it for the
+                                                // same reason as mode/root above.
+    }
+
     std::vector<Sample> out(dry.size(), 0.0f);
     std::vector<Sample> blk(kBlock, 0.0f);
 
@@ -105,6 +135,16 @@ std::vector<Sample> renderVariant(const std::vector<Sample>& dry, double sr,
             ++next;
         }
         engine.process(dry.data() + i, blk.data(), kBlock);
+        // 1/sqrt(N) * 0.9 headroom fudge (BUGS.md VH-009: "The mixer... vh_render already
+        // applies 1/sqrt(n) and an 0.9 trim"). Left UNCHANGED by design (app-design.md
+        // Track D): Engine now has a real feedforward limiter available via
+        // Tuning::limiterOn/outCeilingDb (see engine.cpp's mixImpl() output stage), and
+        // that limiter is the more principled fix for the clipping VH-009 describes -- but
+        // removing this fudge in favour of it would change every existing invocation's
+        // rendered output, including everything RESULTS.md already measured, and nobody
+        // asked for that change. Swapping this tool over to the engine's limiter (passing
+        // a profile with limiterOn=true, or exposing a --limiter flag) is a deliberate
+        // followup for someone to choose, not a side effect of wiring the limiter in.
         const float g = 1.0f / std::sqrt(static_cast<float>(std::max<size_t>(1, held.size())));
         for (FrameCount k = 0; k < kBlock; ++k) {
             out[i + k] = blk[k] * g * 0.9f + (includeDry ? dry[i + k] * 0.5f : 0.0f);
@@ -123,14 +163,25 @@ void report(const char* label, const std::vector<Sample>& s) {
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 5) {
+    std::vector<std::string> args(argv + 1, argv + argc);
+    const auto profilePath = vhtools::extractProfileFlag(args);
+
+    if (args.size() < 4) {
         std::fprintf(stderr,
-            "usage: vh_render <in.wav> <outdir> <prefix> \"<t>:<n>,<n>; <t>:<n>,<n>\" [rootMidi]\n");
+            "usage: vh_render <in.wav> <outdir> <prefix> \"<t>:<n>,<n>; <t>:<n>,<n>\" "
+            "[rootMidi] [--profile <path>]\n");
         return 1;
     }
-    const std::string in = argv[1], outDir = argv[2], prefix = argv[3];
-    const auto chords = parseChords(argv[4]);
-    const int root = argc > 5 ? std::atoi(argv[5]) : 60;
+    const std::string in = args[0], outDir = args[1], prefix = args[2];
+    const auto chords = parseChords(args[3]);
+    const int root = args.size() > 4 ? std::atoi(args[4].c_str()) : 60;
+
+    Tuning profileTuning{};
+    bool haveProfile = false;
+    if (profilePath) {
+        if (!vhtools::loadProfileForTool(*profilePath, profileTuning)) return 1;
+        haveProfile = true;
+    }
 
     std::vector<Sample> dry;
     double sr = 48000.0;
@@ -157,7 +208,8 @@ int main(int argc, char** argv) {
     };
 
     for (const auto& v : variants) {
-        const auto wet = renderVariant(dry, sr, v.c, chords, v.m, *v.p, v.a, v.d, root);
+        const auto wet = renderVariant(dry, sr, v.c, chords, v.m, *v.p, v.a, v.d, root,
+                                        haveProfile ? &profileTuning : nullptr);
         writeWav(outDir + "/" + prefix + v.suffix, wet, sr);
         report(v.label, wet);
     }

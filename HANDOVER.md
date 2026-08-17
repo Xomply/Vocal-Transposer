@@ -188,8 +188,17 @@ cmake --build build -j
 ```
 
 Needs a C++20 compiler and CMake 3.20+. Tests fetch doctest over the network; everything
-else is dependency-free. Verified on g++ 13.3 / CMake 4.4 / Linux. **Not yet verified on
-MSVC** — expect minor fixes around `#pragma pack` and `M_PI` (define `_USE_MATH_DEFINES`).
+else is dependency-free. Verified on g++ 13.3 / CMake 4.4 / Linux, **and now on MSVC /
+Windows 11** — a from-scratch configure and build produces all targets with the whole suite
+passing.
+
+**The MSVC fixes this document predicted, and how they actually went.** `M_PI` was real and it
+was fatal: it is POSIX, not ISO C++, so *nothing* compiled. The prediction above suggested
+defining `_USE_MATH_DEFINES`; that was **rejected** in favour of `vh::kPi` in
+`core/include/vh/types.hpp`, because `epoch.hpp` is a public header and a public header that
+compiles only when its consumer happens to have set a macro is a trap for the next includer —
+which is precisely how this was found, by the JUCE app. `#pragma pack` was predicted and did
+not bite: `offline/main.cpp`'s WAV header packs correctly under MSVC as written.
 
 ### The tools
 

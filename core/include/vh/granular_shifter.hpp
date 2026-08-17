@@ -30,19 +30,12 @@
 
 namespace vh {
 
-struct GranularConfig {
-    // Jump distance in pitch periods when voiced. PROVISIONAL: 1.
-    // Larger jumps mean fewer crossfades (less smearing) but more latency, since the
-    // delay must accommodate the jump.
-    int jumpPeriods = 1;
-
-    // Crossfade length as a fraction of a period. PROVISIONAL: 0.5.
-    // Long fades hide the jump better and smear transients more.
-    float fadeFraction = 0.5f;
-
-    // Fallback grain size when there is no F0 to be synchronous with. PROVISIONAL: 8 ms.
-    float unvoicedGrainMs = 8.0f;
-};
+// GranularTuning (shifter.hpp) IS the config struct now — app-design.md §4.3: "GranularTuning
+// and the existing GranularConfig must not both exist holding the same fields." This alias
+// keeps the constructor-argument API (`GranularShifter{GranularConfig{...}}`) that tools
+// and tests already use, at zero cost: it is the same type under a familiar name, not a
+// conversion.
+using GranularConfig = GranularTuning;
 
 class GranularShifter final : public IPitchShifter {
 public:
@@ -52,6 +45,11 @@ public:
     void reset() noexcept override;
     void process(const ShiftRequest& req) noexcept override;
     FrameCount latencySamples() const noexcept override { return baseDelay_; }
+
+    // Audio thread. Non-allocating: cfg_ is a POD struct assignment, nothing more. See
+    // shifter.hpp's IPitchShifter::setTuning doc comment for the general contract.
+    void setTuning(const ShifterTuning& t) noexcept override;
+
     const char* name() const noexcept override { return "granular"; }
 
 private:

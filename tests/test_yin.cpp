@@ -25,7 +25,7 @@ std::vector<Sample> harmonicTone(double f0, FrameCount n, int partials = 8) {
     for (FrameCount i = 0; i < n; ++i) {
         double s = 0.0;
         for (int k = 1; k <= partials; ++k) {
-            s += std::sin(2.0 * M_PI * f0 * k * static_cast<double>(i) / kSR) / k;
+            s += std::sin(2.0 * kPi * f0 * k * static_cast<double>(i) / kSR) / k;
         }
         v[i] = static_cast<Sample>(s * 0.2);
     }
@@ -169,4 +169,78 @@ TEST_CASE("reported latency matches the window it actually needs") {
     CHECK(y.latencySamples() == y.windowSamples());
     // Two periods of the 70 Hz lower bound, give or take the +1 in maxTau.
     CHECK(y.latencySamples() > static_cast<FrameCount>(2.0 * kSR / 70.0) - 4);
+}
+
+TEST_CASE("setTuning() recomputes maxHoldSamples_ from the new maxHoldMs") {
+    // app-design.md §4.1: maxHoldMs is prepare()-baked into maxHoldSamples_. Without the
+    // recompute in setTuning(), the field would visibly change while the actual hold
+    // budget silently kept using whatever was baked in at prepare() -- a knob that appears
+    // to work and does not, which the design doc calls worse than no knob at all.
+    YinAnalyzer y;
+    y.prepare(kSR, 128);
+    CHECK(y.maxHoldSamples() == static_cast<FrameCount>(200.0 * 0.001 * kSR));   // default 200 ms
+
+    AnalyzerTuning t{};
+    t.maxHoldMs = 20.0f;
+    y.setTuning(t);
+    CHECK(y.maxHoldSamples() == static_cast<FrameCount>(20.0 * 0.001 * kSR));
+
+    // Behavioural proof, mirroring "gives up holding after maxHoldMs" above but reaching
+    // maxHoldMs through setTuning() post-prepare() instead of the constructor.
+    AudioRing ring(1 << 17);
+    run(y, ring, harmonicTone(120.0, 16000));
+    REQUIRE(y.current().voicing == Voicing::Voiced);
+    run(y, ring, noise(24000));   // 500 ms, far beyond the new 20 ms hold
+    CHECK_FALSE(y.current().f0IsHeld);
+    CHECK(y.current().f0Hz == doctest::Approx(0.0f));
+}
+
+TEST_CASE("setTuning() ignores minHz/maxHz -- restart-only, deliberately not read here") {
+    // AnalyzerTuning has NO minHz/maxHz fields at all (see analysis.hpp's own comment) --
+    // they size window_/decimated_/diff_/cmnd_ in prepare() and are absent from the struct
+    // on purpose. This test exists to document the omission as deliberate rather than
+    // let a future reader "fix" it by adding fields setTuning() cannot safely apply. The
+    // only assertion it can make is that windowSamples() (which those buffers are sized
+    // from) is untouched by an otherwise-ordinary setTuning() call.
+    YinAnalyzer y;
+    y.prepare(kSR, 128);
+    const FrameCount before = y.windowSamples();
+    AnalyzerTuning t{};
+    t.threshold = 0.3f;
+    t.hopSamples = 64;
+    y.setTuning(t);
+    CHECK(y.windowSamples() == before);
+}
+
+TEST_CASE("EpochTracker::setTuning changes the ratio without itself retuning the biquad") {
+    // app-design.md §4.5 item 4 / epoch.hpp's setTuning() doc comment: the hazard is a UI
+    // publishing a Tuning every frame during a slider drag defeating the 5% hysteresis
+    // that protects a running biquad's coefficients from being rewritten while z1_/z2_
+    // still reflect the OLD ones. This pins that setTuning() does NOT itself call
+    // setCutoff() -- only the NEXT process() call, evaluated against the SAME hysteresis
+    // gate that always ran, decides whether a new ratio actually retunes anything.
+    EpochTracker e;
+    e.prepare(kSR);
+
+    // Warm the tracker up to a settled cutoff at f0 = 200 Hz (period 240 samples),
+    // default ratio 1.8 -> cutoff should settle near 360 Hz.
+    const float period = static_cast<float>(kSR / 200.0);
+    for (int i = 0; i < 4000; ++i) {
+        const float x = std::sin(2.0f * static_cast<float>(kPi) * 200.0f *
+                                 static_cast<float>(i) / static_cast<float>(kSR));
+        e.process(x, static_cast<Pos>(i + 1), period);
+    }
+    const double settled = e.cutoffHz();
+    CHECK(settled == doctest::Approx(360.0).epsilon(0.05));
+
+    // A big ratio change -- the new target (2.5 * 200 = 500 Hz) sits far outside the 5%
+    // band around 360 Hz, so if setTuning() retuned directly this would move immediately.
+    e.setTuning(2.5, 0.25f, 0.6f, 0.9995f, 120.0, 1500.0);
+    CHECK(e.cutoffHz() == doctest::Approx(settled));   // UNCHANGED immediately after setTuning()
+
+    // One more sample at the SAME period: the hysteresis check now runs against ratio_=2.5
+    // and correctly fires, retuning exactly as it would for a genuine pitch jump -- the
+    // gate still works, it is only now evaluating a different target.
+    e.process(0.0f, 4001, period);
+    CHECK(e.cutoffHz() != doctest::Approx(settled));
 }

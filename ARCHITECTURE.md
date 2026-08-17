@@ -242,9 +242,11 @@ cmake --build build -j
 ./build/vh_render take.wav out/ mytake "0:60,64,67; 2:59,62,67" 60   # your own recording
 ```
 
-Verified: g++ 13.3, CMake 4.4, Linux. **Not yet verified on MSVC/Windows**, which is the
-actual target — expect minor fixes around `#pragma pack` and `M_PI` (define
-`_USE_MATH_DEFINES`).
+Verified: g++ 13.3, CMake 4.4, Linux — **and MSVC / Windows 11**, which is the actual target.
+`M_PI` was the blocker and it was total, not minor: being POSIX rather than ISO C++, it meant
+nothing compiled under MSVC at all. It is now `vh::kPi` in `core/include/vh/types.hpp`; see
+`HANDOVER.md` §5 for why a `_USE_MATH_DEFINES` compile definition was rejected. `#pragma pack`
+turned out fine as written.
 
 ### What the tests actually protect
 

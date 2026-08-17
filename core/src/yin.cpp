@@ -306,4 +306,33 @@ void YinAnalyzer::process(const AudioRing& ring, Pos upTo) noexcept {
     }
 }
 
+void YinAnalyzer::setTuning(const AnalyzerTuning& t) noexcept {
+    VH_RT_SECTION();
+
+    cfg_.threshold = t.threshold;
+    cfg_.hopSamples = t.hopSamples;
+    cfg_.holdThroughUnvoiced = t.holdThroughUnvoiced;
+    cfg_.releaseHops = t.releaseHops;
+    cfg_.maxStepCents = t.maxStepCents;
+    cfg_.jumpConfirmHops = t.jumpConfirmHops;
+
+    // maxHoldMs is prepare()-baked into maxHoldSamples_ (yin.cpp's process(), the hold
+    // budget check). Recomputed here so the field is not silently inert — app-design.md
+    // §4.1, the same reasoning as PsolaTuning::handoverMs -> mixStep_.
+    cfg_.maxHoldMs = t.maxHoldMs;
+    maxHoldSamples_ = static_cast<FrameCount>(cfg_.maxHoldMs * 0.001 * sampleRate_);
+
+    // minHz/maxHz: deliberately not read here. See AnalyzerTuning's header comment
+    // (analysis.hpp) and yin.hpp's setTuning doc comment.
+
+    // The epoch tracker's per-sample constants. See EpochTracker::setTuning's own comment
+    // for why this call does NOT itself retune the biquad -- the 5% hysteresis in
+    // EpochTracker::process() is what decides when a new ratio actually takes effect, and
+    // that gate is unchanged by this call.
+    epochs_.setTuning(static_cast<double>(t.epochCutoffRatio), t.epochLoudnessFactor,
+                      t.epochRefractoryFactor, t.epochEnvelopeRelease,
+                      static_cast<double>(t.epochCutoffMinHz),
+                      static_cast<double>(t.epochCutoffMaxHz));
+}
+
 } // namespace vh

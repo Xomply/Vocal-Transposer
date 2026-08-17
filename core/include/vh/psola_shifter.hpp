@@ -53,6 +53,19 @@ public:
     // Two periods: one for the grain half-length that must exist ahead of the synthesis
     // instant, one for the epoch tracker's own working margin.
     FrameCount latencySamples() const noexcept override { return latency_; }
+
+    // Audio thread. Non-allocating. Recomputes mixStep_ from the new handoverMs — a
+    // prepare()-baked derived value, per app-design.md §4.1 — or the field is silently
+    // INERT despite the number visibly changing in a UI. See the comment on handoverMs_
+    // below for the rest of the reasoning (this is HANDOVER.md §8's single most-wanted
+    // provisional constant, now actually turnable without a rebuild).
+    void setTuning(const ShifterTuning& t) noexcept override;
+
+    // Exposed for tests: proves setTuning() actually recomputed the derived mixStep_
+    // rather than leaving it silently inert. Not used on the audio thread by anything
+    // other than process() itself.
+    double mixStepPerSample() const noexcept { return mixStep_; }
+
     const char* name() const noexcept override { return "psola"; }
 
 private:
@@ -85,8 +98,24 @@ private:
     // crossfade in this codebase, and for the same reason: a fade with a kink in its
     // derivative clicks no matter how long you make it.
     double mix_ = 0.0;
-    double mixStep_ = 0.0;        // per-sample, set in prepare() from kHandoverMs
+    double mixStep_ = 0.0;        // per-sample, derived from handoverMs_ -- see setTuning()
     bool parked_ = true;          // mix_ == 0 and staying there: grain path is idle
+
+    // PROVISIONAL: 8 ms to hand over between the grain path and passthrough.
+    //
+    // Chosen to match the Engine's note envelope, which has been long enough to remove a
+    // click since the first milestone, and short enough that a plosive still reads as a
+    // plosive. The trade is explicit: longer is smoother and smears the consonant, shorter
+    // is tighter and eventually clicks again. The two paths carry the SAME event at
+    // slightly different pitches, so the smear is a doubling rather than a blur — which is
+    // why this can be as short as it is.
+    //
+    // TUNE BY EAR on /t/ and /k/ before anything else in this file. Was a compile-time-only
+    // constant (kHandoverMs in psola_shifter.cpp); promoted to a live field per
+    // app-design.md §5.7/§4.3 so setTuning() can change it without a rebuild. mixStep_ (the
+    // derived per-sample step) is recomputed in setTuning() every time this changes — see
+    // the .cpp — or the knob would be silently inert (app-design.md §4.1).
+    double handoverMs_ = 8.0;
 
     // Passthrough is rendered every block, not only when it is needed, because the
     // starvation backstop cannot know it will fire until after grains have been placed.

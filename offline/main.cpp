@@ -163,8 +163,18 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::printf("rendered %zu frames at %.0f Hz | voices=%d | algorithmic latency=%zu samples (%.1f ms)\n",
+    // Two figures, printed separately and never summed — BUGS.md VH-012. Steady state is
+    // "how far behind the live edge is a locked, running voice" (correct for both modes);
+    // acquisition adds Mode A's F0-lock convergence cost on top (zero for Mode B, which
+    // needs no F0). The old single "algorithmic latency" line conflated the two, over-
+    // reporting Mode A's steady-state figure by roughly YIN's whole analysis window.
+    const vh::FrameCount steady = engine.steadyStateLatencySamples();
+    const vh::FrameCount acquire = engine.acquisitionLatencySamples();
+    std::printf("rendered %zu frames at %.0f Hz | voices=%d | "
+                "steady-state latency=%zu samples (%.1f ms) | "
+                "acquisition latency (Mode A onset only, VH-012)=%zu samples (%.1f ms)\n",
                 input.size(), sr, engine.activeVoiceCount(),
-                engine.latencySamples(), engine.latencySamples() * 1000.0 / sr);
+                steady, steady * 1000.0 / sr,
+                acquire, acquire * 1000.0 / sr);
     return 0;
 }

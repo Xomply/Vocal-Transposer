@@ -1,0 +1,107 @@
+# profiles/factory.vhprofile — the shipped "nicer sounding" starting point.
+#
+# WHY THIS FILE EXISTS AND ISN'T JUST Tuning{}: docs/app-design.md §5.2/§11 and
+# core/include/vh/tuning.hpp's own file header are explicit that Tuning{}'s defaults must
+# reproduce today's engine BIT-EXACTLY (dry_gain=0, wet_gain=1, every humanize field zero)
+# so the existing evidence base (RESULTS.md, click_sweep.py) stays valid without anyone
+# asking to re-baseline it. "Nicer sounding" and "provably a no-op" are two different jobs,
+# so they live in two different places: the struct default is the null hypothesis, and
+# THIS FILE is where taste goes. Load it explicitly (vh_render/vh_sweep's --profile flag,
+# or the app once Track F exists) to hear the difference; nothing loads it implicitly.
+#
+# PROVISIONAL, per docs/app-design.md §5.2/§11: every value in the humanize.* block below.
+# These are the ONLY fields in this file that differ from vh::Tuning{}'s own defaults --
+# everything else here is Tuning{} written out explicitly, byte-for-byte, so that loading
+# this file with zero edits changes NOTHING except the humanization spread. That is a
+# deliberate authoring choice: a factory profile that also quietly changed the blend policy
+# or the analyser's thresholds would make it impossible to attribute a difference you hear
+# to the one thing this file is actually about.
+#
+# THE FIRST THING TO TUNE BY EAR (app-design.md §11): humanize.detune_cents,
+# humanize.detune_drift_cents, humanize.vibrato_rate_hz, humanize.vibrato_depth_cents.
+# Chosen within the ranges app-design.md §5.2/§11 names ("a few cents of detune", "~15-25
+# cents at 5-6.5 Hz of vibrato") but not measured against a listening test -- there is no
+# "right" answer recorded anywhere yet, only a plausible starting point.
+
+schema_version = 2
+
+mode = AbsoluteTarget
+root_midi_note = 60
+voice_cap = 16
+attack_ms = 8
+release_ms = 8
+glide_semis_per_sec = 0
+freeze_window_ms = 500
+velocity_to_gain_min = 1
+velocity_curve = 1
+
+preservation.preserve_envelope = true
+preservation.envelope_warp = 0.8
+preservation.scale_warp_with_shift = true
+preservation.preserve_aperiodicity = true
+preservation.vibrato_constant_in_cents = true
+preservation.unvoiced = PassThroughDecorrelated
+preservation.preserve_timing = true
+
+preservation.voicing.enabled = true
+preservation.voicing.k_mu = 0.3
+preservation.voicing.mu_strength = 1
+preservation.voicing.mu_min = 0.45
+preservation.voicing.mu_max = 2.2
+preservation.voicing.k_tilt = 1
+preservation.voicing.tilt_strength = 1
+preservation.voicing.tilt_gain_min = 0.1
+preservation.voicing.tilt_gain_max = 4
+preservation.voicing.tilt_corner_in_f0 = 2
+
+blend.kind = FastOnly
+blend.rs_crossover_hz = 220
+blend.rs_width_octaves = 1
+blend.oh_start_ms = 25
+blend.oh_end_ms = 70
+blend.alignment = 0
+
+# --- PROVISIONAL: the entire reason this file exists. See the file header. -----------------
+humanize.detune_cents = 6
+humanize.detune_drift_cents = 3
+humanize.onset_jitter_ms = 0
+humanize.vibrato_rate_hz = 5.5
+humanize.vibrato_depth_cents = 20
+humanize.envelope_warp_spread = 0
+humanize.pan_spread = 0
+# ---------------------------------------------------------------------------------------
+
+decor_min_ms = 0.5
+decor_max_ms = 4
+
+shifters.granular.jump_periods = 1
+shifters.granular.fade_fraction = 0.5
+shifters.granular.unvoiced_grain_ms = 8
+shifters.granular.geometry_smooth_ms = 20
+
+shifters.psola.handover_ms = 8
+
+analyzer.threshold = 0.15
+analyzer.hop_samples = 128
+analyzer.hold_through_unvoiced = true
+analyzer.max_hold_ms = 200
+analyzer.release_hops = 4
+analyzer.max_step_cents = 120
+analyzer.jump_confirm_hops = 2
+analyzer.epoch_cutoff_ratio = 1.8
+analyzer.epoch_loudness_factor = 0.25
+analyzer.epoch_refractory_factor = 0.6
+analyzer.epoch_envelope_release = 0.9995
+analyzer.epoch_cutoff_min_hz = 120
+analyzer.epoch_cutoff_max_hz = 1500
+
+input_trim_db = 0
+input_gate_on = false
+input_gate_db = -60
+dry_gain = 0
+wet_gain = 1
+out_ceiling_db = 0
+limiter_on = false
+
+name = Factory
+notes = PROVISIONAL humanization (app-design.md section 5.2 / section 11): modest detune (6 cents static spread, 3 cents slow drift) plus vibrato at 5.5 Hz / 20 cents depth. Everything else in this profile is vh::Tuning{}'s own default, unchanged -- see the file header. Not yet tuned by ear; this is a starting point, not a measurement.

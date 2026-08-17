@@ -115,6 +115,63 @@ struct Voice {
     ReadCursor cursor{};
     Humanization hum{};
 
+    // --- hold/freeze bookkeeping (app-design.md §5.1) ---------------------------------
+    //
+    // WHY TWO FLAGS AND NOT ONE: hold and freeze are now separate controls (Engine::
+    // setHold/setFreeze) that can be engaged independently or together, so a voice needs
+    // to remember independently "am I being kept alive by hold" and "am I latched by
+    // freeze" -- collapsing them back into one bool is exactly the two-names-one-behaviour
+    // trap the split was written to avoid.
+    //
+    // holdDeferred: true from the moment a note-off arrives while Engine::setHold(true) is
+    // in effect, until setHold(false) releases every voice with this flag set. The voice
+    // itself is untouched while deferred -- state, cursor, everything keeps tracking live
+    // input exactly as an unreleased note would. This is conventional sustain.
+    bool holdDeferred = false;
+
+    // freezeLatched: true for every voice that was SOUNDING at the instant
+    // Engine::setFreeze(true) was called. While latched, the voice ignores note-off
+    // entirely (see Engine::noteOff) -- not deferred, simply not listened to -- and its
+    // cursor is stalled into a loop window (see ReadCursor::frozen). Cleared, and the
+    // voice moved to Releasing, when setFreeze(false) is called. PROVISIONAL (app-design.md
+    // §5.1): latching as well as stalling is what makes freeze a pad you can sing over
+    // instead of a note that silently keeps chasing input queued up behind it, but it is
+    // untested by ear. If it turns out wrong, the fix is one line in Engine::setFreeze:
+    // stop setting this flag and freeze becomes a pure cursor-stall, with note-off staying
+    // live exactly as it always could.
+    bool freezeLatched = false;
+
+    // --- humanization runtime state (app-design.md §5.2) -------------------------------
+    //
+    // Everything a voice needs to keep between blocks that is NOT itself a per-voice
+    // "value" (those live in `hum` above, alongside the static per-voice detune/vibrato-
+    // rate/depth that Engine::noteOn derives once from the voice index and never touches
+    // again). These three are the exception: they change every block.
+    //
+    // humDriftValue: the CURRENT output of the slow random walk described by
+    // Humanization::detuneDriftCents (the walk's amplitude). Starts at exactly 0 and the
+    // recurrence in Engine::process is constructed so that it STAYS exactly 0, bit for
+    // bit, for as long as the amplitude is exactly 0 -- see that function's comment. That
+    // is what lets humanization-off renders stay bit-identical without a branch.
+    float humDriftValue = 0.0f;
+
+    // humDriftRng: a per-voice RNG seed for the drift walk, seeded from the voice index at
+    // noteOn with a DIFFERENT multiplier than cursor.rngState (which seeds the freeze
+    // restart jitter and the granular shifter's unvoiced-jump jitter) -- sharing one seed
+    // across unrelated random processes would correlate them (the drift and the freeze
+    // jitter would "roll the same dice"), which defeats the point of derandomising each
+    // independently.
+    std::uint32_t humDriftRng = 1;
+
+    // startAtPos: onsetJitterMs's entry-timing spread. Set at noteOn to
+    // `noteOnPos + jitterSamples`; Engine::process skips this voice (does not advance its
+    // cursor, exactly like the pre-existing history gate) until the ring's write position
+    // reaches it. At the default jitter of 0 this is exactly noteOnPos, and because
+    // noteOnPos is captured from ring_->writePos() BEFORE that block's write() call runs,
+    // writePos() has already moved past it by the time this is checked -- so the gate
+    // never fires and this is a no-op, matching today's behaviour exactly.
+    Pos startAtPos = 0;
+
     float gain = 1.0f;
 
     // Amplitude envelope, applied by the Engine.

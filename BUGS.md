@@ -517,6 +517,153 @@ into each seam; it moves the artefact from click-like to chorus-like rather than
 
 ---
 
+### VH-012 — `Engine::latencySamples()` reports an estimator's staleness as if it were transport delay, over-reporting Mode A by ~28.6 ms
+**Status:** Backlog | **Severity:** S3 | **Area:** `core/src/engine.cpp`, `core/src/psola_shifter.cpp`, `core/src/yin.cpp` | **Owner:** —
+**Found:** code audit while designing the standalone app, not by listening — see the severity
+note for why that matters here.
+
+**What the function does.** For `RatioSource::AbsoluteTarget` (Mode A), `Engine::latencySamples()`
+(`core/src/engine.cpp` lines 77-98) returns `worst + std::max(lf, lq) + decor`, where
+`worst = analyzer_->latencySamples()` is YIN's analysis window — 1372 samples / 28.6 ms at
+48 kHz with a 70 Hz floor (`core/src/yin.cpp` line 20, `windowSamples_ = maxTau_ * 2`) — and
+`lf` / `lq` are the fast and quality shifters' own `latencySamples()`. The three terms are
+added as if they were three serial stages of one signal path.
+
+**Why that's the wrong operation.** `worst` is not a transport delay: YIN does not hold up
+any audio, and a shifter's read position is not gated on the analyzer beyond needing a ratio
+value to apply. `windowSamples_` measures how much observation YIN needs before ITS OWN
+estimate is trustworthy — a *convergence* cost, paid once when the tracker locks onto a new
+pitch, not a recurring per-block one. `docs/latency-budget.md` states this as the rule the
+whole document is organised around (lines 20-22): "Onset ≠ steady state. Estimation latency
+is a *convergence* cost paid once when the tracker locks, not a tax on every buffer. This
+distinction is the single most important thing in this document and the one most often got
+wrong." `Engine::latencySamples()` gets it wrong in exactly the way that sentence warns
+about — it adds a convergence cost into a figure that is otherwise a genuine steady-state
+transport-delay sum (`lf`/`lq`, the shifters' algorithmic latency, and the decorrelation
+delay, all paid on every sample forever).
+
+**Consequence.** `offline/main.cpp` (lines 166-168) prints this number to the user as
+"algorithmic latency" in ms, and it is the natural figure a host would read for plugin delay
+compensation or a UI latency readout. Once YIN has locked, Mode A's real steady-state figure
+is `max(lf,lq) + decor` — the same 32.6 ms Mode B reports, since Mode B needs no F0 and so
+pays none of `worst` — but the function reports 61.2 ms for Mode A unconditionally, steady
+state included. A host or UI built on this number over-reports Mode A's steady-state latency
+by roughly double; if it drove an actual compensation delay rather than just a display, it
+would add 28.6 ms more than necessary on every block, forever, to cover a cost that is real
+only in the moments right after a pitch change.
+
+**The counter-argument, stated fairly.** The comment immediately above the `return`
+(`engine.cpp` lines 94-97) says the figure is deliberately "when the full blend is available,
+which is what a host needs for delay compensation" — a worst case is a defensible thing to
+report if only one number is wanted, and Mode A genuinely cannot produce a *correct* ratio
+before YIN's first lock. The problem is not that the worst case is wrong to compute; it is
+that acquisition cost and steady-state cost answer different questions ("how long until this
+is usable at all" vs "how far behind the live edge is it once running"), and collapsing them
+into one `FrameCount` throws away a distinction the engine's own comment two lines above
+(`engine.cpp` lines 80-81, "this asymmetry is the whole latency argument for Mode B") already
+treats as meaningful.
+
+**A related, smaller defect in the same code path, folded in here rather than opened
+separately.** `PsolaShifter::latencySamples()` returns a FIXED `latency_ = 2 * maxHalf_`,
+computed once in `prepare()` from `kLowestF0 = 70.0` (`core/src/psola_shifter.cpp` lines 12,
+30, 53) — 1372 samples / 28.6 ms regardless of the singer's actual pitch. The interface
+comment it implements (`core/include/vh/shifter.hpp` lines 85-93) argues latency must be
+queryable specifically BECAUSE "a grain is sized in pitch periods, so a shifter's latency
+changes as the singer moves" (lines 88-89) — PSOLA's own implementation doesn't honour that.
+Contrast `GranularShifter`, whose comment makes the identical argument
+(`core/src/granular_shifter.cpp` lines 27-29, "sized in periods it is correct for both, and
+`latencySamples()` reports the truth to the blender") and then actually does it: its delay is
+sized from the smoothed current period every block. PSOLA's own grain placement already
+agrees with this and doesn't need the worst case — `halfSrc = min(period, maxHalf_)`
+(`psola_shifter.cpp` lines 277-278) caps the real per-grain lookahead at the CURRENT period,
+so at a 220 Hz voice the actual need is ~218 samples (4.5 ms), well under the 1372 samples the
+function reports. The practical costs are (a) the alignment delay computed from this figure
+(`engine.cpp` lines 242-248) is larger than the current note requires at any pitch above the
+floor, and (b) the same over-reporting problem as above, one level down.
+
+**Ruled out.** A tempting but incorrect reading of this code is that instantiating the
+quality engine forces the FAST engine's own OUTPUT to lag by the quality engine's latency
+too, since both share one `ReadCursor`. Checked directly, and it is false. `GranularShifter`
+anchors its read pointer to the live write head, not the cursor: `pos_ = writePos - baseDelay_`
+(`core/src/granular_shifter.cpp` line 121), set only on the first block after a reset, after
+which `pos_` advances purely by `rate` inside the shifter itself. The shared cursor is
+advanced by the granular shifter as pure bookkeeping — its own comment says so
+(`core/src/granular_shifter.cpp` lines 218-221: "The cursor tracks wall-clock input
+consumption, not the read pointer... The blender aligns on the cursor"). Only PSOLA actually
+reads its cursor position and emits there (`const Pos c = cur.next;`, `psola_shifter.cpp`
+line 248), which is exactly why PSOLA's own reported latency is a correct description of
+PSOLA. The fast engine keeps its short, pitch-dependent lag in the blend regardless of
+whether the quality engine is present; the defect is in what the ENGINE reports about the
+combination, not in what either shifter does to the audio. (One real, smaller effect from the
+shared cursor: `noteOn`'s lookback and `process`'s history gate — `engine.cpp` lines 148-153
+and 271-274 — both use `max(fast, quality)`, so a blended voice's ONSET is gated a little
+later than the fast engine alone would need. That delays when the voice starts, not how stale
+its samples are once running, and it is silent rather than a defect in itself — it is
+mentioned here only so nobody rediscovers it and mistakes it for the read-lag claim this
+entry originally made and retracted.)
+
+**Candidate fix.** Split `Engine::latencySamples()` into two queries — a steady-state figure
+(`max(lf,lq) + decor`, already correct for Mode B and correct for Mode A once locked) and an
+acquisition/onset figure (adds `worst` for Mode A) — mirroring the distinction
+`docs/latency-budget.md` already documents, rather than collapsing them into one number that
+answers only one of the two questions a caller might have. Separately, consider making
+`PsolaShifter::latencySamples()` pitch-dependent like `GranularShifter`'s: the grain-sizing
+code already computes the real, smaller need in `halfSrc` and simply doesn't expose it.
+
+**Severity: S3.** Nothing sounds different because of this — it is a reporting/interface
+defect, not an audio defect, and (per Ruled out, above) it does not make the fast path stale.
+The consequence that matters is design and integration: a host or UI trusting the reported
+number is misled about Mode A's steady-state latency by roughly 2x, which could drive a wrong
+PDC value or a wrong latency readout — consequential for anyone building on this number,
+inaudible on its own. That combination (a real, checkable defect with no audio symptom) is
+what S3's "latent trap" clause is for.
+
+**Blocks / blocked by.** None currently.
+
+---
+
+### VH-013 — two independently maintained "lowest pitch" constants, consistent only by coincidence
+**Status:** Backlog | **Severity:** S3 | **Area:** `core/src/engine.cpp`, `core/src/psola_shifter.cpp` | **Owner:** —
+**Found:** code audit while designing the standalone app, not by hearing anything
+(`docs/app-design.md` §4.5, hazard 3, and §13, item 7 — both flag this and say to log it here).
+
+**The two constants.** `core/src/engine.cpp` line 48 sizes the blend alignment buffer as
+`sampleRate / 60.0 * 3 + maxBlock` — an assumed 60 Hz pitch floor; the comment two lines above
+(lines 46-47) says the delay is sized for "the full quality-path latency, which is two periods
+of the lowest fundamental we track." `core/src/psola_shifter.cpp` line 12 separately declares
+`kLowestF0 = 70.0`, and that is the constant that actually drives the quality path's
+`latencySamples()` (`psola_shifter.cpp` lines 30, 53 — see VH-012). Nothing in the code ties
+the 60 in `engine.cpp` to the 70 in `psola_shifter.cpp`; they are two independent literals
+that happen to describe the same quantity.
+
+**Why it hasn't bitten.** They are safe today only because 60 < 70 leaves incidental
+headroom — the alignment buffer is sized for a lower (and therefore longer-period, more
+conservative) floor than PSOLA actually needs. `core/include/vh/yin.hpp` line 31 sets
+`YinConfig::minHz = 70.0f` for the same reason PSOLA uses 70 — its own comment calls 70 "low
+enough for a bass voice" — which is the kind of constant that gets revisited if the project
+ever needs to track a genuinely low voice. If `kLowestF0` is ever lowered to match, `maxHalf_`
+and therefore PSOLA's `latency_` grow, but the alignment buffer sized from the un-updated 60 Hz
+assumption does not.
+
+**Failure mode if it happens.** Not a crash and not an assertion — the alignment buffer wraps
+and reads a wrong-aged sample, i.e. the delay-compensated fast-path audio would be time-aligned
+against stale or wrapped history. Nothing in the current code paths would flag this; it would
+show up, if at all, as a subtle phase or timing artefact in the blend — the kind of symptom
+that reads as a completely different bug.
+
+**Candidate fix.** One named constant shared by both sites, with a `static_assert` (or an
+equivalent check in `prepare()`) tying the alignment buffer's assumed floor to whatever
+`kLowestF0` actually is, so the two cannot drift apart silently again.
+
+**Severity: S3 — latent, not currently manifesting.** Nothing about this is audible today:
+60 < 70 holds in the code as it stands, and nothing lowers `kLowestF0` at runtime. It is
+logged because the trap is silent and because it would be trivial to introduce this exact
+defect by changing the lowest-pitch floor in only one of the two places that need it.
+
+**Blocks / blocked by.** None.
+
+---
+
 # Done
 
 *VH-003 and VH-008 landed with measurements and a listening test in `RESULTS.md`

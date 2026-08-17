@@ -83,6 +83,19 @@ struct PreservationSpec {
     //
     // WHY: vibrato is a musical interval, not a frequency excursion. Preserved in Hz, an
     // octave-up halves the perceived depth and an octave-down doubles it. CERTAIN.
+    //
+    // DEAD, AND DELIBERATELY LEFT UNIMPLEMENTED (app-design.md §5.2/§5.8) — do not wire this
+    // up. Every shift in this engine is applied as a RATIO (r *= 2^(...)), never as an
+    // additive Hz offset, so the singer's own vibrato — an F0 excursion already expressed in
+    // Hz by the analyser but folded into the ratio multiplicatively — passes through the
+    // shift IN CENTS unconditionally, by construction, with no code path that could do
+    // otherwise. There is no "Hz mode" for this flag to guard against turning off. That is a
+    // better outcome than a flag (nothing to misconfigure), but it means this field has no
+    // reader and never will while the architecture stays ratio-based — a knob that does
+    // nothing is worse than a missing knob (§5.8), so it is NOT promoted into Tuning, the
+    // UI, or the profile schema (see tuning.hpp's "DELIBERATELY ABSENT" section). Left here,
+    // unread, as a Tier-0 field alongside preserveEnvelope/scaleWarpWithShift/etc., for a
+    // later cleanup track to delete outright rather than for this one to half-wire.
     bool vibratoConstantInCents = true;
 
     UnvoicedPolicy unvoiced = UnvoicedPolicy::PassThroughDecorrelated;

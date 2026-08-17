@@ -14,6 +14,12 @@ endif()
 option(VH_BUILD_TESTS   "Build unit tests"        ON)
 option(VH_BUILD_OFFLINE "Build offline harness"   ON)
 
+# OFF by default so the headless CI/test build stays the default build — core being
+# testable without a framework is the load-bearing build decision this file opens with.
+# Turning this on pulls in JUCE via FetchContent (see app/CMakeLists.txt) and builds the
+# standalone instrument (docs/app-design.md, Track F).
+option(VH_BUILD_APP     "Build the JUCE standalone app" OFF)
+
 # ---------------------------------------------------------------------------
 # core — the whole DSP system, with NO framework dependency.
 #
@@ -48,6 +54,27 @@ target_compile_options(vh_core PRIVATE
 # belongs in an explicit FTZ/DAZ setting at stream start, not in a blanket compiler flag.
 
 # ---------------------------------------------------------------------------
+# vh_profile — serializes vh::Tuning to/from a flat, hand-editable .vhprofile file
+# (profile/include/vh/profile.hpp). Its own top-level directory, NOT inside core/: per
+# docs/app-design.md §7, core stays dependency-free and Tuning stays a POD that knows
+# nothing about files (see the vh_core comment above for why that is load-bearing).
+# Standard library only. Linked by the offline tools (vh_render, vh_sweep, below) and,
+# later, the app (Track F) — one parser shared, not two silently diverging ones, which is
+# the entire payoff §7 describes: a profile tuned by ear becomes the literal input to the
+# offline measurement tools.
+# ---------------------------------------------------------------------------
+add_library(vh_profile STATIC
+  profile/src/profile.cpp
+)
+target_include_directories(vh_profile PUBLIC profile/include)
+target_link_libraries(vh_profile PUBLIC vh_core)
+
+target_compile_options(vh_profile PRIVATE
+  $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic -Wshadow -Wconversion>
+  $<$<CXX_COMPILER_ID:MSVC>:/W4>
+)
+
+# ---------------------------------------------------------------------------
 # tests
 # ---------------------------------------------------------------------------
 if(VH_BUILD_TESTS)
@@ -75,8 +102,12 @@ if(VH_BUILD_TESTS)
     tests/test_engine.cpp
     tests/test_shifters.cpp
     tests/test_continuity.cpp
+    tests/test_tuning.cpp
+    tests/test_profile.cpp
+    tests/test_humanization.cpp
+    tests/test_output_stage.cpp
   )
-  target_link_libraries(vh_tests PRIVATE vh_core doctest::doctest)
+  target_link_libraries(vh_tests PRIVATE vh_core vh_profile doctest::doctest)
 
   enable_testing()
   add_test(NAME unit COMMAND vh_tests)
@@ -102,8 +133,11 @@ if(VH_BUILD_OFFLINE)
 
   # Runs a REAL recording through the engine. The most important tool going forward:
   # everything else is validated on a synthetic singer.
+  # Links vh_profile (which itself links vh_core) rather than vh_core directly: an optional
+  # `--profile <path>` argument (app-design.md §7/Track E) lets this tool load the same
+  # Tuning the app would apply, on top of every existing invocation working unchanged.
   add_executable(vh_render tools/render.cpp)
-  target_link_libraries(vh_render PRIVATE vh_core)
+  target_link_libraries(vh_render PRIVATE vh_core vh_profile)
   target_include_directories(vh_render PRIVATE tools)
 
   add_executable(vh_bench tools/bench.cpp)
@@ -114,8 +148,10 @@ if(VH_BUILD_OFFLINE)
   # control render can be produced at the SAME RATIO as the thing under test, which
   # vh_render structurally cannot do — its variant table fixes RatioSource per variant.
   # See the header comment in tools/sweep.cpp.
+  # Also gains an optional `--profile <path>` argument (see vh_render above) — vh_profile
+  # links vh_core, so this is the only line that needs to change to reach it.
   add_executable(vh_sweep tools/sweep.cpp)
-  target_link_libraries(vh_sweep PRIVATE vh_core)
+  target_link_libraries(vh_sweep PRIVATE vh_core vh_profile)
   target_include_directories(vh_sweep PRIVATE tools)
 
   # vh_sweep plus a per-block CSV of what the analyser believed. Exists because BUGS.md
@@ -124,4 +160,11 @@ if(VH_BUILD_OFFLINE)
   add_executable(vh_trace tools/trace.cpp)
   target_link_libraries(vh_trace PRIVATE vh_core)
   target_include_directories(vh_trace PRIVATE tools)
+endif()
+
+# ---------------------------------------------------------------------------
+# app — the JUCE standalone instrument. See app/CMakeLists.txt and app/README.md.
+# ---------------------------------------------------------------------------
+if(VH_BUILD_APP)
+  add_subdirectory(app)
 endif()

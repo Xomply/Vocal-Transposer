@@ -20,6 +20,7 @@
 // human listens to; this renders one axis of an experiment.
 //
 // usage: vh_sweep <in.wav> <out.wav> <granular|psola> <semitones> [muStrength] [tiltStrength]
+//                  [--profile <path>]
 //
 // The two optional arguments expose the voicing profile so the model can be swept from
 // the shell without a rebuild. Both default to 1.0 (the derived curve). Both 0.0 is the
@@ -27,11 +28,23 @@
 //
 //   muStrength    0 = hold formants (mu == 1)   1 = mu = ratio^0.3   3.33 = mu = ratio
 //   tiltStrength  0 = no open-quotient correction   1 = full
+//
+// --profile is ADDITIVE (app-design.md §7/Track E): every invocation above with no
+// --profile behaves exactly as it always did. When given, the profile's Tuning is applied
+// via Engine::applyTuning() on top of the fixed things THIS tool exists to hold constant --
+// `mode` stays IntervalFromRoot and `rootMidiNote` stays kRoot regardless of what the
+// profile says (see the header comment above: this tool's whole reason to exist is a fixed
+// Mode-B ratio), and alignment stays 0.0f (single-engine FastOnlyPolicy, nothing to align
+// against). If muStrength/tiltStrength were given EXPLICITLY on the command line, they win
+// over the profile's own voicing.muStrength/tiltStrength -- those two CLI arguments are
+// this tool's own reason to exist, so an explicit one takes precedence; a profile supplies
+// them only when the caller did not ask for a specific value.
 
 #include "vh/engine.hpp"
 #include "vh/granular_shifter.hpp"
 #include "vh/psola_shifter.hpp"
 #include "vh/yin.hpp"
+#include "profile_cli.hpp"
 #include "wav.hpp"
 
 #include <cstdio>
@@ -57,19 +70,31 @@ constexpr int kRoot = 60;
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 5) {
+    std::vector<std::string> args(argv + 1, argv + argc);
+    const auto profilePath = vhtools::extractProfileFlag(args);
+
+    if (args.size() < 4) {
         std::fprintf(stderr,
             "usage: vh_sweep <in.wav> <out.wav> <granular|psola> <semitones>"
-            " [muStrength] [tiltStrength]\n"
+            " [muStrength] [tiltStrength] [--profile <path>]\n"
             "  Renders ONE engine at ONE constant interval, Mode B (IntervalFromRoot).\n"
             "  muStrength/tiltStrength default to 1.0; 0 0 is the pre-profile engine.\n");
         return 1;
     }
 
-    const std::string inPath = argv[1], outPath = argv[2], which = argv[3];
-    const int semis = std::atoi(argv[4]);
-    const float muStrength   = argc > 5 ? static_cast<float>(std::atof(argv[5])) : 1.0f;
-    const float tiltStrength = argc > 6 ? static_cast<float>(std::atof(argv[6])) : 1.0f;
+    const std::string inPath = args[0], outPath = args[1], which = args[2];
+    const int semis = std::atoi(args[3].c_str());
+    const bool haveMu   = args.size() > 4;
+    const bool haveTilt = args.size() > 5;
+    const float muStrength   = haveMu   ? static_cast<float>(std::atof(args[4].c_str())) : 1.0f;
+    const float tiltStrength = haveTilt ? static_cast<float>(std::atof(args[5].c_str())) : 1.0f;
+
+    Tuning profileTuning{};
+    bool haveProfile = false;
+    if (profilePath) {
+        if (!vhtools::loadProfileForTool(*profilePath, profileTuning)) return 1;
+        haveProfile = true;
+    }
 
     if (which != "granular" && which != "psola") {
         std::fprintf(stderr, "error: engine must be 'granular' or 'psola', got '%s'\n", which.c_str());
@@ -111,6 +136,21 @@ int main(int argc, char** argv) {
     FastOnlyPolicy fastOnly;
     engine.setBlendPolicy(&fastOnly);
     engine.setBlendAlignment(0.0f);
+
+    if (haveProfile) {
+        // mode/rootMidiNote/alignment are this tool's fixed experimental variables (see
+        // the header comment) and are reasserted, not taken from the profile -- same
+        // reasoning as vh_render's identical guard. muStrength/tiltStrength: profile
+        // supplies them, but an EXPLICIT CLI value (haveMu/haveTilt) overrides the
+        // profile's, because those two arguments are this tool's own reason to exist.
+        Tuning t = profileTuning;
+        t.mode = RatioSource::IntervalFromRoot;
+        t.rootMidiNote = kRoot;
+        if (haveMu)   t.preservation.voicing.muStrength = muStrength;
+        if (haveTilt) t.preservation.voicing.tiltStrength = tiltStrength;
+        engine.applyTuning(t);
+        engine.setBlendAlignment(0.0f);
+    }
 
     std::vector<Sample> out(dry.size(), 0.0f);
     std::vector<Sample> blk(kBlock, 0.0f);

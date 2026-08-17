@@ -20,3 +20,8 @@ sustained_dry.wav
 melody_dry.wav
 
 __pycache__/
+
+# Regenerable measurement output from tools/demo_battery.py. Same rule as the audio
+# above: the tool rewrites it wholesale, so committing it is a binary-ish diff that
+# conveys nothing the printed table does not.
+demo_new/battery_report.json
